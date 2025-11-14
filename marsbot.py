@@ -1,6 +1,7 @@
 import asyncio
 import io
 import logging
+import os
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -199,7 +200,9 @@ async def reply_one_photo(msg: Message):
 
 async def reply_photo(update: Update, _ctx):
     if is_user_in_whitelist(conn.cursor(), update.effective_chat.id, update.effective_user.id):
+        print(f"user {update.effective_chat.id}/{update.effective_user.id} 在白名单中，忽略")
         return
+    print(f"尝试处理含图片消息 {update.effective_chat.id}/{update.message.id}")
     if update.message.media_group_id:
         await reply_grouped_photo(update.message)
     else:
@@ -277,9 +280,16 @@ async def bot_help(update: Update, _ctx):
 
 
 def main():
-    application = (Application.builder()
-                   .proxy("http://localhost:7451")
-                   .token(config.BOT_TOKEN).build())
+    builder = Application.builder()
+    builder.token(config.BOT_TOKEN)
+    builder.base_url()
+    if base_url := os.getenv('BOT_BASE_URL'):
+        builder.base_url(base_url)
+    if base_file_url := os.getenv('BOT_BASE_FILE_URL'):
+        builder.base_file_url(base_file_url)
+    if proxy := os.getenv('BOT_PROXY'):
+        builder.proxy(proxy)
+    application = builder.build()
     application.add_handler(MessageHandler(filters.PHOTO, reply_photo))
     application.add_handler(CommandHandler("pic_info", get_pic_info))
     application.add_handler(CommandHandler("add_whitelist", add_to_whitelist))
