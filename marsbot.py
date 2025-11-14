@@ -1,361 +1,295 @@
-import atexit
-import codecs
+import asyncio
 import io
-import json
 import logging
-import threading
+import sqlite3
 import time
-from typing import Dict, Optional
+from dataclasses import dataclass
+from weakref import WeakValueDictionary
 
 import cv2
 import numpy as np
-import telethon
-from telethon.events import NewMessage
-from telethon.tl.functions.channels import GetParticipantRequest
-from telethon.tl.types import (MessageMediaPhoto,
-                               PeerChannel,
-                               PeerUser,
-                               Photo,
-                               ChannelParticipantCreator,
-                               ChannelParticipantAdmin, )
-from config import admins, BOT_NAME, API_ID, API_HASH, BOT_SESSION_NAME, BOT_TOKEN
+from telegram import Update, Chat, PhotoSize, Message
+from telegram.ext import Application, MessageHandler, filters, CommandHandler
+
+import config
+from config import conn
 
 logging.basicConfig(format='[%(levelname) 5s/%(asctime)s] %(name)s: %(message)s',
                     level=logging.WARNING)
 
 
-def init_bot():
-    bot_ = telethon.TelegramClient(
-        BOT_SESSION_NAME,
-        API_ID,
-        API_HASH
-    )
-    bot_.start(bot_token=BOT_TOKEN)
-    return bot_
-
-
-bot = init_bot()
-
-
-class MarsInfo:
-    def __init__(self):
-        self.unique_id_to_dhash: Dict[str, str] = dict()
-        self.dhash_mars_count: Dict[str, int] = dict()
-        self.dhash_last_msg: Dict[str, int] = dict()
-        self.white_list_users: Dict[str, bool] = dict()
-
-    def dhash_count_plus(self, dhash):
-        self.dhash_mars_count[dhash] = self.dhash_mars_count.get(dhash, 0) + 1
-
-    def add_uid_and_dhash(self, uid, dhash):
-        self.unique_id_to_dhash[uid] = dhash
-        self.dhash_count_plus(dhash)
-
-    def has_uid(self, uid):
-        return uid in self.unique_id_to_dhash.keys()
-
-    def uid_count(self, uid):
-        dhash = self.unique_id_to_dhash[uid]
-        return self.dhash_count(dhash)
-
-    def uid_count_plus(self, uid):
-        dhash = self.unique_id_to_dhash[uid]
-        self.dhash_count_plus(dhash)
-
-    def dhash_count(self, dhash):
-        return self.dhash_mars_count.get(dhash, 0)
-
-    def get_uid_last_msg(self, uid):
-        dhash = self.unique_id_to_dhash[uid]
-        return self.get_dhash_last_msg(dhash)
-
-    def get_dhash_last_msg(self, dhash):
-        return self.dhash_last_msg[dhash]
-
-    def set_uid_last_msg(self, uid, last_msg_id):
-        dhash = self.unique_id_to_dhash[uid]
-        self.set_dhash_last_msg(dhash, last_msg_id)
-
-    def set_dhash_last_msg(self, dhash, last_msg_id):
-        self.dhash_last_msg[dhash] = last_msg_id
-
-    def add_white_list(self, user_id: int):
-        user_id = str(user_id)
-        self.white_list_users[user_id] = True
-
-    def remove_white_list(self, user_id: int):
-        user_id = str(user_id)
-        self.white_list_users.pop(user_id)
-
-    def user_in_white_list(self, user_id: int):
-        user_id = str(user_id)
-        return user_id in self.white_list_users
-
-    def to_dict(self):
-        data = {"uid2dhash": self.unique_id_to_dhash,
-                "dhash_mar_count": self.dhash_mars_count,
-                "dhash_last_msg": self.dhash_last_msg,
-                "white_list_users": self.white_list_users}
-        return data
-
-    @staticmethod
-    def from_dict(data):
-        info = MarsInfo()
-        info.dhash_mars_count = data["dhash_mar_count"]
-        info.unique_id_to_dhash = data.get("uid2dhash", {})
-        info.dhash_last_msg = data.get("dhash_last_msg", {})
-        info.white_list_users = data.get("white_list_users", {})
-
-        return info
-
-    _use_mars_bot_groups = {}
-
-    @classmethod
-    def is_chat_enable(cls, chat_id):
-        return chat_id in cls._use_mars_bot_groups.keys()
-
-    @classmethod
-    def get_chat_ins(cls, chat_id) -> Optional['MarsInfo']:
-        return cls._use_mars_bot_groups.get(chat_id, None)
-
-    @classmethod
-    def add_chat(cls, chat_id):
-        if cls.is_chat_enable(chat_id):
-            return cls.get_chat_ins(chat_id)
-        info = MarsInfo()
-        cls._use_mars_bot_groups[chat_id] = info
-        return info
-
-    @classmethod
-    def remove_chat(cls, chat_id):
-        if cls.is_chat_enable(chat_id):
-            cls._use_mars_bot_groups.pop(chat_id)
-
-    @classmethod
-    def save(cls, filename="mars.json"):
-        with open(filename, "w", encoding="utf-8")as f:
-            json.dump(cls._use_mars_bot_groups, f, default=lambda obj: obj.to_dict(), ensure_ascii=False,
-                      sort_keys=True, indent=1)
-
-    @classmethod
-    def load(cls, filename="mars.json"):
-        try:
-            with open(filename, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                for key, value in data.items():
-                    key = int(key)
-                    cls._use_mars_bot_groups[key] = cls.from_dict(value)
-        except FileNotFoundError:
-            return
-
-
-def cmd_pattern(cmd):
-    return r"/{cmd}(@{bot_name})?(\s+|$)".format(cmd=cmd, bot_name=BOT_NAME)
-
-
-def get_bot_chat_id(peer) -> int:
-    if isinstance(peer, PeerUser):
-        return peer.user_id
-    elif isinstance(peer, PeerChannel):
-        to_id = -(1000000000000 + peer.channel_id)
-        return to_id
-    else:
-        raise RuntimeError("peer 既不是用户也不是频道，无法推测发生了什么,to:{}".format(peer))
-
-
-def get_raw_chat_id(peer) -> int:
-    if isinstance(peer, PeerUser):
-        return peer.user_id
-    elif isinstance(peer, PeerChannel):
-        return peer.channel_id
-    else:
-        raise RuntimeError("peer 既不是用户也不是频道，无法推测发生了什么,to:{}".format(peer))
-
-
-def get_from_user(event: NewMessage.Event) -> int:
-    peer = event.message.peer_id
-    if isinstance(peer, PeerUser):
-        return peer.user_id
-    elif isinstance(peer, PeerChannel):
-        peer = event.message.from_id
-        return get_bot_chat_id(peer)
-    raise RuntimeError("无法识别事件来源用户, event:{}".format(event))
-
-
-def check_image(event: NewMessage.Event) -> bool:
-    chat_id = get_bot_chat_id(event.message.peer_id)
-    mars_info = MarsInfo.get_chat_ins(chat_id)
-    user_id = get_from_user(event)
-    if mars_info is not None and not mars_info.user_in_white_list(user_id):
-        return isinstance(event.message.media, MessageMediaPhoto)
-
-
-def dhash_bytes(data):
+def dhash_bytes(data: bytes) -> bytes:
     data = np.frombuffer(data, np.uint8)
     img = cv2.imdecode(data, cv2.IMREAD_ANYCOLOR)
     img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     img = cv2.resize(img, (9, 8), interpolation=cv2.INTER_AREA)
     dhash_bits = np.greater(img[:, :8], img[:, 1:]).flatten()
     dhash = np.packbits(dhash_bits).tobytes()
-    return codecs.encode(dhash, "hex").decode("ascii")
+    return dhash
 
 
-def generate_mars_text(link, count, threshold):
-    msg_text_fmt = '你这张图片已经<a href="{0}">火星{1}次</a>了！'
-    mars_x_times_fmt = '你已经让这张图片<a href="{0}">第{1}次火星</a>了，现在本车送你 ”火星之王“ 称号！'
-    mars_grater_x_times_fmt = '火星之王，收了你的神通吧，这图都已经<a href="{0}">火星{1}次</a>了！'
-    if count > threshold:
-        return mars_grater_x_times_fmt.format(link, count)
-    elif count == threshold:
-        return mars_x_times_fmt.format(link, count)
-    else:
-        return msg_text_fmt.format(link, count)
+_mars_cache = WeakValueDictionary()
 
 
-@bot.on(NewMessage(func=check_image))
-async def check_photo_mars(event: NewMessage.Event):
-    chat_id = get_bot_chat_id(event.message.peer_id)
-    photo: Photo = event.message.media.photo
-    photo_uid = "uid" + str((photo.id * 10) + photo.dc_id)  # 该语句为唯一确定uid的方法
-    mars_info = MarsInfo.get_chat_ins(chat_id)
-    msg_id = event.message.id
-    t_me_link_fmt = "https://t.me/c/{}/{}"
+@dataclass(slots=True, weakref_slot=True)
+class MarsInfo:
+    group_id: int
+    pic_dhash: bytes
+    count: int
+    last_msg_id: int
+    in_whitelist: bool
 
-    if mars_info.has_uid(photo_uid):
-        count = mars_info.uid_count(photo_uid)
-        mars_info.uid_count_plus(photo_uid)
-        last_msg_id = mars_info.get_uid_last_msg(photo_uid)
-        link = t_me_link_fmt.format(get_raw_chat_id(event.message.peer_id), last_msg_id)
-        msg_text = generate_mars_text(link, count, 10)
-        mars_info.set_uid_last_msg(photo_uid, msg_id)
-    else:
-        buffer = io.BytesIO()
-        await bot.download_media(event.message, buffer, thumb=-1)
-        buffer.seek(0)
-        data = buffer.read()
-        dhash = dhash_bytes(data)
-        count = mars_info.dhash_count(dhash)
-        mars_info.add_uid_and_dhash(photo_uid, dhash)
-        if count > 0:
-            last_msg_id = mars_info.get_dhash_last_msg(dhash)
-            link = t_me_link_fmt.format(get_raw_chat_id(event.message.peer_id), last_msg_id)
-            msg_text = generate_mars_text(link, count, 10)
-            mars_info.set_dhash_last_msg(dhash, msg_id)
+    @staticmethod
+    def query_or_default(cursor: sqlite3.Cursor, group_id: int, dhash: bytes) -> 'MarsInfo':
+        tmp = _mars_cache.get((group_id, dhash))
+        if tmp is not None:
+            return tmp
+        start = time.perf_counter_ns()
+        row = cursor.execute(
+            '''SELECT group_id, pic_dhash, count, last_msg_id, in_whitelist
+               FROM mars_info
+               WHERE group_id = ?
+                 AND pic_dhash = ?''',
+            (group_id, dhash)).fetchone()
+        end = time.perf_counter_ns()
+        print("query one data time elapsed: {} us".format((end - start) / 1000))
+        if row is None:
+            info = MarsInfo(group_id=group_id, pic_dhash=dhash, count=0, last_msg_id=0, in_whitelist=False)
         else:
-            mars_info.set_dhash_last_msg(dhash, msg_id)
-            return
-    await bot.send_message(event.chat_id, msg_text, reply_to=event.message.id, parse_mode="HTML")
+            info = MarsInfo(*row)
+        _mars_cache[(group_id, dhash)] = info
+        return info
+
+    def upsert(self, cursor: sqlite3.Cursor):
+        # 存在就更新count和last_msg_id，不存在就新建一个
+        start = time.perf_counter_ns()
+
+        cursor.execute(
+            '''
+            INSERT INTO mars_info (group_id, pic_dhash, count, last_msg_id, in_whitelist)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(group_id, pic_dhash) DO UPDATE SET count=excluded.count,
+                                                           last_msg_id=excluded.last_msg_id,
+                                                           in_whitelist=excluded.in_whitelist
+            ''',
+            (self.group_id, self.pic_dhash, self.count, self.last_msg_id, int(self.in_whitelist))
+        )
+        end = time.perf_counter_ns()
+        print("upsert one data time elapsed: {} us".format((end - start) / 1000))
+        cursor.connection.commit()
 
 
-@bot.on(NewMessage(pattern=cmd_pattern("enable")))
-async def chat_enable(event: NewMessage.Event):
-    if not isinstance(event.message.peer_id, PeerChannel):
-        await bot.send_message(event.chat_id, "该对话并非 群组/频道 ，无法正常配置，如果你认为该情况不应该出现，请联系开发者。")
-        return
-    participant = await bot(GetParticipantRequest(event.message.peer_id, event.message.from_id))
-    if not isinstance(participant.participant, (ChannelParticipantAdmin, ChannelParticipantCreator)):
-        await bot.send_message(event.chat_id, "只有该群的 创建者/管理员 可以改变火星车状态")
-        return
-    chat_id = get_bot_chat_id(event.message.peer_id)
-    if MarsInfo.is_chat_enable(chat_id):
-        await bot.send_message(event.chat_id, "这个群组已经启用了。", reply_to=event.message.id)
+def get_dhash_from_fuid(cursor: sqlite3.Cursor, fuid: str) -> bytes | None:
+    row = cursor.execute('SELECT dhash FROM fuid_to_dhash WHERE fuid=?', (fuid,)).fetchone()
+    if row is None:
+        return None
+    return row[0]
+
+
+def is_user_in_whitelist(cursor: sqlite3.Cursor, group_id: int, user_id: int) -> bool:
+    return bool(cursor.execute('SELECT EXISTS (SELECT 1 FROM group_user_in_whitelist WHERE group_id=? AND user_id=?)',
+                               (group_id, user_id)))
+
+
+async def get_dhash(cursor, bot, photo: PhotoSize):
+    dhash = get_dhash_from_fuid(cursor, photo.file_unique_id)
+    if dhash:
+        return dhash
+    file = await bot.get_file(photo)
+    buf = io.BytesIO()
+    await file.download_to_memory(buf)
+    dhash = dhash_bytes(buf.getvalue())
+    cursor.execute('''INSERT INTO fuid_to_dhash (fuid, dhash)
+                      VALUES (?, ?)''', (photo.file_unique_id, dhash))
+    cursor.connection.commit()
+    return dhash
+
+
+def get_label(chat: Chat, mars_info: MarsInfo) -> tuple[str, str]:
+    if chat.link:
+        link = f"{chat.link}/{mars_info.last_msg_id}"
+    elif chat.id < 0:
+        cid = -chat.id - 1000000000000
+        link = f'https://t.me/c/{cid}/{mars_info.last_msg_id}'
     else:
-        MarsInfo.add_chat(chat_id)
-        await bot.send_message(event.chat_id, "启用火星车。", reply_to=event.message.id)
-
-
-@bot.on(NewMessage(pattern=cmd_pattern("disable")))
-async def chat_disable(event: NewMessage.Event):
-    if not isinstance(event.message.peer_id, PeerChannel):
-        await bot.send_message(event.chat_id, "该对话并非 群组/频道 ，无法正常配置，如果你认为该情况不应该出现，请联系开发者。")
-        return
-    participant = await bot(GetParticipantRequest(event.message.peer_id, event.message.from_id))
-    if not isinstance(participant.participant, (ChannelParticipantAdmin, ChannelParticipantCreator)):
-        await bot.send_message(event.chat_id, "只有该群的 创建者/管理员 可以改变火星车状态")
-        return
-    chat_id = get_bot_chat_id(event.message.peer_id)
-    if MarsInfo.is_chat_enable(chat_id):
-        MarsInfo.remove_chat(chat_id)
-        await bot.send_message(event.chat_id, "已停用，存储的相关 图片dhash、图片ID、消息ID等将会被移除。", reply_to=event.message.id)
+        link = ''
+    if link:
+        label_start = f'<a href="{link}">'
+        label_end = f'</a>'
     else:
-        await bot.send_message(event.chat_id, "这个群组根本就没启用过。")
+        label_start = ''
+        label_end = ''
+    return label_start, label_end
 
 
-@bot.on(NewMessage(pattern=cmd_pattern("add_whitelist")))
-async def add_white_list(event: NewMessage.Event):
-    chat_id = get_bot_chat_id(event.message.peer_id)
-    mars_info = MarsInfo.get_chat_ins(chat_id)
-    if mars_info is None:
-        await bot.send_message(event.chat_id, "该群组/频道没有启用火星车，无法添加用户白名单", reply_to=event.message.id)
-        return
-    user_id = get_from_user(event)
-    if mars_info.user_in_white_list(user_id):
-        await bot.send_message(event.chat_id,
-                               "用户 `uid:{}` 已经在火星车白名单里了".format(user_id)
-                               , reply_to=event.message.id, parse_mode="markdown")
+def build_mars_reply(chat: Chat, mars_info: MarsInfo) -> str:
+    label_start, label_end = get_label(chat, mars_info)
+    if mars_info.count < 3:
+        return f'这张图片已经{label_start}火星{mars_info.count}次{label_end}了！'
+    elif mars_info.count == 3:
+        return f'这张图已经{label_start}火星了{mars_info.count}次{label_end}了，现在本车送你 ”火星之王“ 称号！'
     else:
-        mars_info.add_white_list(user_id)
-        await bot.send_message(event.chat_id,
-                               "用户 `uid:{}` 已加入火星车白名单".format(user_id)
-                               , reply_to=event.message.id, parse_mode="markdown")
+        return f'火星之王，收了你的神通吧，这张图都让您{label_start}火星{mars_info.count}次{label_end}了！'
 
 
-@bot.on(NewMessage(pattern=cmd_pattern("remove_whitelist")))
-async def remove_white_list(event: NewMessage.Event):
-    chat_id = get_bot_chat_id(event.message.peer_id)
-    mars_info = MarsInfo.get_chat_ins(chat_id)
-    if mars_info is None:
-        await bot.send_message(event.chat_id, "该群组/频道没有启用火星车，无法添加用户白名单", reply_to=event.message.id)
-        return
-    user_id = get_from_user(event)
-    if mars_info.user_in_white_list(user_id):
-        mars_info.remove_white_list(user_id)
-        await bot.send_message(event.chat_id,
-                               "用户 `uid:{}` 已从白名单中移除".format(user_id)
-                               , reply_to=event.message.id, parse_mode="markdown")
+def build_mars_reply_grouped(chat: Chat, mars_info: MarsInfo) -> str:
+    label_start, label_end = get_label(chat, mars_info)
+    if mars_info.count < 3:
+        return f'这一组图片火星了{label_start}火星{mars_info.count}次{label_end}了！'
+    elif mars_info.count == 3:
+        return f'您这一组图片已经{label_start}火星了{mars_info.count}次{label_end}了，现在本车送你 ”火星之王“ 称号！'
     else:
-        await bot.send_message(event.chat_id,
-                               "用户 `uid:{}` 并没有在火星车白名单里".format(user_id)
-                               , reply_to=event.message.id, parse_mode="markdown")
+        return f'火星之王，收了你的神通吧，这些图都让您{label_start}火星{mars_info.count}次{label_end}了！'
 
 
-@bot.on(NewMessage(chats=admins, pattern=r"^/save"))
-async def save(event: NewMessage.Event):
-    MarsInfo.save()
-    await bot.send_message(event.chat_id, "manual saved")
+_grouped_media: dict[str, list[Message]] = {}
 
 
-@bot.on(NewMessage(from_users=admins, pattern=r"/msinfo"))
-async def get_msg_info(event: NewMessage.Event):
-    print(event.message.stringify())
-    reply_message = await event.message.get_reply_message()
-    print(reply_message.stringify())
+async def msg_queue(msg_list: list[Message]):
+    length = len(msg_list)
+    for i in range(5):
+        await asyncio.sleep(1.5)
+        if len(msg_list) == length:
+            break
+        length = len(msg_list)
+    msg = msg_list[0]
+    try:
+        dhash_list = []
+        for m in msg_list:
+            if not m.photo:
+                continue
+            dhash_list.append(
+                await get_dhash(conn.cursor(), msg.get_bot(), m.photo[-1])
+            )
+        for i, dhash in enumerate(dhash_list):
+            mars_info = MarsInfo.query_or_default(conn.cursor(), msg.chat_id, dhash)
+            msg = msg_list[i]
+            if not mars_info.in_whitelist and mars_info.count > 0:
+                await msg.reply_html(build_mars_reply_grouped(msg.chat, mars_info), reply_to_message_id=msg.message_id)
+                mars_info.count += 1
+                mars_info.last_msg_id = msg_list[i].id
+                mars_info.upsert(conn.cursor())
+                break
+            mars_info.count += 1
+            mars_info.last_msg_id = msg.chat_id
+            mars_info.upsert(conn.cursor())
+    finally:
+        del _grouped_media[msg.media_group_id]
 
 
-def timer_save_threading():
-    """
-    每过12小时保存
-    :return:
-    """
-    while True:
-        time.sleep(86400 / 2)
-        MarsInfo.save()
+async def reply_grouped_photo(msg: Message):
+    if msg.media_group_id in _grouped_media:
+        _grouped_media[msg.media_group_id].append(msg)
+        return
+    msg_list = [msg]
+    _grouped_media[msg.media_group_id] = msg_list
+    asyncio.create_task(msg_queue(msg_list), name=f"msg_queue[{msg.media_group_id}]")
 
 
-def test_dhash(filename):
-    """
-    测试用函数
-    :param filename:
-    :return:
-    """
-    with open(filename, "rb") as f:
-        return dhash_bytes(f.read())
+async def reply_one_photo(msg: Message):
+    chat_id = msg.chat_id
+    dhash = await get_dhash(conn.cursor(), msg.get_bot(), msg.photo[-1])
+    mars_info = MarsInfo.query_or_default(conn.cursor(), chat_id, dhash)
+    if not mars_info.in_whitelist and mars_info.count > 0:
+        await msg.reply_html(build_mars_reply(msg.chat, mars_info), reply_to_message_id=msg.message_id)
+    mars_info.count += 1
+    mars_info.last_msg_id = msg.message_id
+    mars_info.upsert(conn.cursor())
+
+
+async def reply_photo(update: Update, _ctx):
+    if is_user_in_whitelist(conn.cursor(), update.effective_chat.id, update.effective_user.id):
+        return
+    if update.message.media_group_id:
+        await reply_grouped_photo(update.message)
+    else:
+        await reply_one_photo(update.message)
+
+
+async def get_refer_photo(update: Update):
+    photo = None
+    if update.message.photo:
+        photo = update.message.photo[-1]
+    elif update.message.reply_to_message and update.message.reply_to_message.photo:
+        photo = update.message.reply_to_message.photo[-1]
+    if not photo:
+        await update.message.reply_text('火星车没有发现您引用了任何图片。\n尝试发送图片使用命令，或回复特定图片。',
+                                        reply_to_message_id=update.message.message_id)
+        return None
+    return photo
+
+
+async def get_pic_info(update: Update, _ctx):
+    photo = await get_refer_photo(update)
+    if not photo:
+        return
+    dhash = await get_dhash(conn.cursor(), update.get_bot(), photo)
+    mars_info = MarsInfo.query_or_default(conn.cursor(), update.message.chat_id, dhash)
+    whitelist_str = '🙈 它在本群的火星白名单中' if mars_info.in_whitelist else '🟢 它不在本群的火星白名单当中'
+    await update.message.reply_text(f'File unique id: {photo.file_unique_id}\n'
+                                    f'dhash: {dhash.hex().upper()}\n'
+                                    f'在本群的火星次数:{mars_info.count}\n'
+                                    f'{whitelist_str}',
+                                    reply_to_message_id=update.message.message_id)
+
+
+async def add_to_whitelist(update: Update, _ctx):
+    photo = await get_refer_photo(update)
+    if not photo:
+        return
+    dhash = await get_dhash(conn.cursor(), update.get_bot(), photo)
+    mars_info = MarsInfo.query_or_default(conn.cursor(), update.message.chat_id, dhash)
+    if mars_info.in_whitelist:
+        await update.message.reply_text('这张图片已经在白名单当中了', reply_to_message_id=update.message.message_id)
+        return
+    mars_info.in_whitelist = True
+    mars_info.upsert(conn.cursor())
+    await update.message.reply_text('成功将图片加入白名单', reply_to_message_id=update.message.message_id)
+
+
+async def remove_from_whitelist(update: Update, _ctx):
+    photo = await get_refer_photo(update)
+    if not photo:
+        await update.message.reply_text('火星车没有发现您引用了任何图片。\n尝试发送图片使用命令，或回复特定图片。',
+                                        reply_to_message_id=update.message.message_id)
+        return
+    dhash = await get_dhash(conn.cursor(), update.get_bot(), photo)
+    mars_info = MarsInfo.query_or_default(conn.cursor(), update.message.chat_id, dhash)
+    if mars_info.in_whitelist:
+        await update.message.reply_text('这张图片并不在白名单中', reply_to_message_id=update.message.message_id)
+        return
+    mars_info.in_whitelist = False
+    mars_info.upsert(conn.cursor())
+    await update.message.reply_text('成功将图片移除白名单', reply_to_message_id=update.message.message_id)
+
+
+async def bot_help(update: Update, _ctx):
+    bot_name = update.get_bot().username
+    at_suffix = f'@{bot_name}'
+    if update.message.chat.type == 'private':
+        at_suffix = ''
+
+    await update.message.reply_text(
+        f'/help{at_suffix} 显示本帮助信息\n'
+        f'/pic_info{at_suffix} 获取图片信息\n'
+        f'/add_whitelist{at_suffix} 将图片添加到白名单\n'
+        f'/remove_from_whitelist{at_suffix} 将图片移除白名单')
+
+
+def main():
+    application = (Application.builder()
+                   .proxy("http://localhost:7451")
+                   .token(config.BOT_TOKEN).build())
+    application.add_handler(MessageHandler(filters.PHOTO, reply_photo))
+    application.add_handler(CommandHandler("pic_info", get_pic_info))
+    application.add_handler(CommandHandler("add_whitelist", add_to_whitelist))
+    application.add_handler(CommandHandler("remove_whitelist", remove_from_whitelist))
+    application.add_handler(CommandHandler("help", bot_help))
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == '__main__':
-    MarsInfo.load()
-    atexit.register(MarsInfo.save)
-    t = threading.Thread(target=timer_save_threading, daemon=True)
-    t.start()
-    with bot:
-        bot.run_until_disconnected()
+    try:
+        main()
+    finally:
+        conn.commit()

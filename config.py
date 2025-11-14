@@ -1,14 +1,38 @@
-API_ID: int = 0
-API_HASH: str = "get API_ID and API_HASH from telegram link:https://core.telegram.org/api/obtaining_api_id"
-BOT_TOKEN: str = "get from bot father"
-BOT_SESSION_NAME: str = "any valid file name"  # 任何合法的文件名都可以
-BOT_NAME: str = "@username_bot"  # 申请的bot 的username， @开头的那个，这里面的 @ 不能删
-admins = []  # 能操作bot的userID，实际上就是能手动保存
+import sqlite3
+import os
 
-CAN_RUN = False
-if not CAN_RUN:
-    # 如果你觉得配置好了把这里删了就行了，或者把 CAN_RUN 改为True
-    print("该bot基于Telethon+OpenCV开发\n"
-          "部署需要手动申请 API_HASH API_ID BOT_TOKEN\n"
-          "其中的大部分特性需要Python3.7及以上版本")
+if not os.environ.get("BOT_TOKEN"):
+    print("需要配置环境变量 BOT_TOKEN, 请使用 export BOT_TOKEN=<YOUR_BOT_TOKEN> 来配置")
     exit(1)
+
+BOT_TOKEN: str = os.environ['BOT_TOKEN']
+
+def init(connection: sqlite3.Connection):
+    cursor = connection.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS mars_info
+                      (
+                          group_id     INTEGER NOT NULL,
+                          pic_dhash    BLOB    NOT NULL,
+                          count        INTEGER NOT NULL DEFAULT 0 CHECK (count > 0),
+                          last_msg_id  INTEGER NOT NULL DEFAULT 0 CHECK (last_msg_id > 0),
+                          in_whitelist INTEGER NOT NULL DEFAULT 0 CHECK (in_whitelist IN (0, 1)),
+                          UNIQUE (group_id, pic_dhash)
+                      );''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS fuid_to_dhash
+                      (
+                          fuid  TEXT    UNIQUE NOT NULL ,
+                          dhash BLOB    NOT NULL
+                      )''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS group_user_in_whitelist
+                (
+                    group_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    PRIMARY KEY (group_id, user_id)
+                ) WITHOUT ROWID;''')
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA synchronous=OFF")
+    cursor.execute("PRAGMA cache_size=-20000;")
+    connection.commit()
+
+conn = sqlite3.connect('mars.db')
+init(conn)

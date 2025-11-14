@@ -11,3 +11,7 @@ gen
 mars-bot.session
 mars-bot.session-journal
 mars.json
+/mars.db
+/mars.db-*
+/.venv
+/*.rmp
