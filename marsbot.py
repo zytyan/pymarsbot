@@ -89,7 +89,7 @@ def get_dhash_from_fuid(cursor: sqlite3.Cursor, fuid: str) -> bytes | None:
 
 def is_user_in_whitelist(cursor: sqlite3.Cursor, group_id: int, user_id: int) -> bool:
     return bool(cursor.execute('SELECT EXISTS (SELECT 1 FROM group_user_in_whitelist WHERE group_id=? AND user_id=?)',
-                               (group_id, user_id)))
+                               (group_id, user_id)).fetchone()[0])
 
 
 async def get_dhash(cursor, bot, photo: PhotoSize):
