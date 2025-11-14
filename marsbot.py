@@ -210,7 +210,7 @@ async def reply_photo(update: Update, _ctx):
         print(f"user {update.effective_chat.id}/{update.effective_user.id} 在白名单中，忽略")
         return
     print(f"尝试处理含图片消息 {update.effective_chat.id}/{update.effective_message.id}")
-    if update.message.media_group_id:
+    if update.effective_message.media_group_id:
         await reply_grouped_photo(update.effective_message)
     else:
         await reply_one_photo(update.effective_message)
@@ -218,13 +218,13 @@ async def reply_photo(update: Update, _ctx):
 
 async def get_refer_photo(update: Update):
     photo = None
-    if update.message.photo:
-        photo = update.message.photo[-1]
-    elif update.message.reply_to_message and update.message.reply_to_message.photo:
-        photo = update.message.reply_to_message.photo[-1]
+    if update.effective_message.photo:
+        photo = update.effective_message.photo[-1]
+    elif update.effective_message.reply_to_message and update.effective_message.reply_to_message.photo:
+        photo = update.effective_message.reply_to_message.photo[-1]
     if not photo:
-        await update.message.reply_text('火星车没有发现您引用了任何图片。\n尝试发送图片使用命令，或回复特定图片。',
-                                        reply_to_message_id=update.message.message_id)
+        await update.effective_message.reply_text('火星车没有发现您引用了任何图片。\n尝试发送图片使用命令，或回复特定图片。',
+                                        reply_to_message_id=update.effective_message.message_id)
         return None
     return photo
 
@@ -243,13 +243,13 @@ async def get_pic_info(update: Update, _ctx):
     if not photo:
         return
     dhash = await get_dhash(conn.cursor(), update.get_bot(), photo)
-    mars_info = MarsInfo.query_or_default(conn.cursor(), update.message.chat_id, dhash)
+    mars_info = MarsInfo.query_or_default(conn.cursor(), update.effective_message.chat_id, dhash)
     whitelist_str = '🙈 它在本群的火星白名单中' if mars_info.in_whitelist else '🟢 它不在本群的火星白名单当中'
-    await update.message.reply_text(f'File unique id: {photo.file_unique_id}\n'
+    await update.effective_message.reply_text(f'File unique id: {photo.file_unique_id}\n'
                                     f'dhash: {dhash.hex().upper()}\n'
                                     f'在本群的火星次数:{mars_info.count}\n'
                                     f'{whitelist_str}',
-                                    reply_to_message_id=update.message.message_id)
+                                    reply_to_message_id=update.effective_message.message_id)
 
 
 async def add_to_whitelist(update: Update, _ctx):
@@ -257,38 +257,38 @@ async def add_to_whitelist(update: Update, _ctx):
     if not photo:
         return
     dhash = await get_dhash(conn.cursor(), update.get_bot(), photo)
-    mars_info = MarsInfo.query_or_default(conn.cursor(), update.message.chat_id, dhash)
+    mars_info = MarsInfo.query_or_default(conn.cursor(), update.effective_message.chat_id, dhash)
     if mars_info.in_whitelist:
-        await update.message.reply_text('这张图片已经在白名单当中了', reply_to_message_id=update.message.message_id)
+        await update.effective_message.reply_text('这张图片已经在白名单当中了', reply_to_message_id=update.effective_message.message_id)
         return
     mars_info.in_whitelist = True
     mars_info.upsert(conn.cursor())
-    await update.message.reply_text('成功将图片加入白名单', reply_to_message_id=update.message.message_id)
+    await update.effective_message.reply_text('成功将图片加入白名单', reply_to_message_id=update.effective_message.message_id)
 
 
 async def remove_from_whitelist(update: Update, _ctx):
     photo = await get_refer_photo(update)
     if not photo:
-        await update.message.reply_text('火星车没有发现您引用了任何图片。\n尝试发送图片使用命令，或回复特定图片。',
-                                        reply_to_message_id=update.message.message_id)
+        await update.effective_message.reply_text('火星车没有发现您引用了任何图片。\n尝试发送图片使用命令，或回复特定图片。',
+                                        reply_to_message_id=update.effective_message.message_id)
         return
     dhash = await get_dhash(conn.cursor(), update.get_bot(), photo)
-    mars_info = MarsInfo.query_or_default(conn.cursor(), update.message.chat_id, dhash)
+    mars_info = MarsInfo.query_or_default(conn.cursor(), update.effective_message.chat_id, dhash)
     if mars_info.in_whitelist:
-        await update.message.reply_text('这张图片并不在白名单中', reply_to_message_id=update.message.message_id)
+        await update.effective_message.reply_text('这张图片并不在白名单中', reply_to_message_id=update.effective_message.message_id)
         return
     mars_info.in_whitelist = False
     mars_info.upsert(conn.cursor())
-    await update.message.reply_text('成功将图片移除白名单', reply_to_message_id=update.message.message_id)
+    await update.effective_message.reply_text('成功将图片移除白名单', reply_to_message_id=update.effective_message.message_id)
 
 
 async def bot_help(update: Update, _ctx):
     bot_name = update.get_bot().username
     at_suffix = f'@{bot_name}'
-    if update.message.chat.type == 'private':
+    if update.effective_message.chat.type == 'private':
         at_suffix = ''
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f'/help{at_suffix} 显示本帮助信息\n'
         f'/pic_info{at_suffix} 获取图片信息\n'
         f'/add_whitelist{at_suffix} 将图片添加到白名单\n'
