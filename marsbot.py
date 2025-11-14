@@ -282,7 +282,6 @@ async def bot_help(update: Update, _ctx):
 def main():
     builder = Application.builder()
     builder.token(config.BOT_TOKEN)
-    builder.base_url()
     if base_url := os.getenv('BOT_BASE_URL'):
         builder.base_url(base_url)
     if base_file_url := os.getenv('BOT_BASE_FILE_URL'):
