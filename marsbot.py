@@ -9,8 +9,8 @@ from weakref import WeakValueDictionary
 
 import cv2
 import numpy as np
-from telegram import Update, Chat, PhotoSize, Message
-from telegram.ext import Application, MessageHandler, filters, CommandHandler
+from telegram import Update, Chat, PhotoSize, Message, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, MessageHandler, filters, CommandHandler, CallbackQueryHandler
 
 import config
 from config import conn
@@ -192,7 +192,14 @@ async def reply_one_photo(msg: Message):
     dhash = await get_dhash(conn.cursor(), msg.get_bot(), msg.photo[-1])
     mars_info = MarsInfo.query_or_default(conn.cursor(), chat_id, dhash)
     if not mars_info.in_whitelist and mars_info.count > 0:
-        await msg.reply_html(build_mars_reply(msg.chat, mars_info), reply_to_message_id=msg.message_id)
+        reply_markup = None
+        if mars_info.count > 5:
+            reply_markup = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("将图片添加至白名单", callback_data=f'wl:{mars_info.pic_dhash.hex()}'), ]]
+            )
+        await msg.reply_html(build_mars_reply(msg.chat, mars_info),
+                             reply_to_message_id=msg.message_id,
+                             reply_markup=reply_markup)
     mars_info.count += 1
     mars_info.last_msg_id = msg.message_id
     mars_info.upsert(conn.cursor())
@@ -202,11 +209,11 @@ async def reply_photo(update: Update, _ctx):
     if is_user_in_whitelist(conn.cursor(), update.effective_chat.id, update.effective_user.id):
         print(f"user {update.effective_chat.id}/{update.effective_user.id} 在白名单中，忽略")
         return
-    print(f"尝试处理含图片消息 {update.effective_chat.id}/{update.message.id}")
+    print(f"尝试处理含图片消息 {update.effective_chat.id}/{update.effective_message.id}")
     if update.message.media_group_id:
-        await reply_grouped_photo(update.message)
+        await reply_grouped_photo(update.effective_message)
     else:
-        await reply_one_photo(update.message)
+        await reply_one_photo(update.effective_message)
 
 
 async def get_refer_photo(update: Update):
@@ -220,6 +227,15 @@ async def get_refer_photo(update: Update):
                                         reply_to_message_id=update.message.message_id)
         return None
     return photo
+
+
+async def add_pic_whitelist_by_cb(update: Update, _ctx):
+    group_id = update.callback_query.message.chat.id
+    dhash = bytes.fromhex(update.callback_query.data.split(":")[1])
+    mars_info = MarsInfo.query_or_default(conn.cursor(), group_id, dhash)
+    mars_info.in_whitelist = True
+    mars_info.upsert(conn.cursor())
+    await update.callback_query.answer("该图片已加入白名单")
 
 
 async def get_pic_info(update: Update, _ctx):
@@ -290,6 +306,7 @@ def main():
         builder.proxy(proxy)
     application = builder.build()
     application.add_handler(MessageHandler(filters.PHOTO, reply_photo))
+    application.add_handler(CallbackQueryHandler(add_pic_whitelist_by_cb, r'^wl:[\da-fA-F]+$'))
     application.add_handler(CommandHandler("pic_info", get_pic_info))
     application.add_handler(CommandHandler("add_whitelist", add_to_whitelist))
     application.add_handler(CommandHandler("remove_whitelist", remove_from_whitelist))
