@@ -503,7 +503,13 @@ async def export_data(update: Update, _ctx):
     finally:
         _exporting_chat[chat_id].running = False
         os.remove(out_filename)
-    asyncio.create_task(delete_exporting())
+    task = asyncio.create_task(delete_exporting())
+
+    def done(f):
+        if f.exception() is not None:
+            print(f.exception())
+
+    task.add_done_callback(done)
 
 
 async def export_help(update: Update, _ctx):
@@ -549,7 +555,7 @@ def main():
             Update.CHANNEL_POST, Update.MESSAGE, Update.EDITED_MESSAGE,
             # 将来bot被加入到群组时可以回应
             Update.MY_CHAT_MEMBER
-        ])
+        ], drop_pending_updates=False)
 
 
 if __name__ == '__main__':
