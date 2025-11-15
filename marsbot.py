@@ -101,7 +101,7 @@ def start_backup_thread():
             except Exception as e:
                 print(e)
 
-    thread = threading.Thread(target=inner, daemon=True)
+    thread = threading.Thread(target=inner, daemon=True, name="db_backup_thread")
     thread.start()
 
 
