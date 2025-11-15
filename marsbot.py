@@ -411,7 +411,8 @@ async def bot_help(update: Update, _ctx):
         f'/stat{at_suffix} 显示统计信息\n'
         f'/pic_info{at_suffix} 获取图片信息\n'
         f'/add_whitelist{at_suffix} 将图片添加到白名单\n'
-        f'/remove_from_whitelist{at_suffix} 将图片移除白名单')
+        f'/remove_from_whitelist{at_suffix} 将图片移除白名单\n'
+        f'/export{at_suffix} 导出本聊天中火星车的数据')
 
 
 async def send_welcome(bot, chat_id):
