@@ -393,7 +393,7 @@ async def bot_stat(update: Update, _ctx):
     await msg.reply_text(f'火星车当前一共服务了{group_count}个群组\n'
                          f'当前群组ID: {msg.chat_id}\n'
                          f'本群一共记录了 {mars_count} 张不同的图片\n'
-                         f'本次统计共耗时 {(end - start) / 1000} us\n'
+                         f'本次统计共耗时 {(end - start) / 1000_000} ms\n'
                          f'火星车与您同在')
 
 
