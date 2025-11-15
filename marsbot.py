@@ -438,8 +438,6 @@ async def welcome(update: Update, _ctx):
         return
     if member.old_chat_member.status not in (ChatMember.LEFT, ChatMember.BANNED):
         return
-    if member.new_chat_member.status not in (ChatMember.LEFT, ChatMember.BANNED):
-        return
     if member.new_chat_member.status == ChatMember.MEMBER:
         await send_welcome(update.get_bot(), update.effective_message.chat_id)
 
