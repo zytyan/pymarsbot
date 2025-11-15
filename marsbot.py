@@ -484,7 +484,6 @@ async def export_data(update: Update, _ctx):
 
     _exporting_chat[chat_id] = ExportingChat(chat_id, time.time(), True)
     filename = await asyncio.to_thread(export, chat_id)
-    await update.effective_message.reply_document(filename)
     out_filename = filename
     try:
         tar_filename = f"{filename}.tar.gz"
