@@ -9,4 +9,5 @@ dependencies = [
     "numpy>=2.3.4",
     "opencv-python>=4.11.0.86",
     "python-telegram-bot>=22.5",
+    "zstd>=1.5.7.2",
 ]

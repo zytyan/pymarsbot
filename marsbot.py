@@ -52,6 +52,11 @@ def backup_database():
     with backup:
         conn.backup(backup)
     backup.close()
+    import zstd
+    zstd_filename = filename + '.zstd'
+    with open(filename, 'rb') as fi, open(zstd_filename, 'wb') as fo:
+        fo.write(zstd.compress(fi.read(), 5, max(1, os.cpu_count() - 2)))
+    os.remove(filename)
     s3_api = os.getenv("S3_API_ENDPOINT")
     if not s3_api:
         print("没有配置 S3_API_ENDPOINT ，仅将文件备份在本地。")
@@ -76,8 +81,8 @@ def backup_database():
         aws_access_key_id=key_id,
         aws_secret_access_key=key_secret,
     )
-    s3.upload_file(filename, bucket, filename)
-    os.remove(filename)
+    s3.upload_file(zstd_filename, bucket, zstd_filename)
+    os.remove(zstd_filename)
 
 
 def start_backup_thread():
@@ -425,6 +430,7 @@ def main():
 
 if __name__ == '__main__':
     try:
-        main()
+        # main()
+        backup_database()
     finally:
         conn.commit()
