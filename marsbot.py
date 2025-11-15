@@ -19,8 +19,8 @@ def init_database(connection: sqlite3.Connection):
                       (
                           group_id     INTEGER NOT NULL,
                           pic_dhash    BLOB    NOT NULL,
-                          count        INTEGER NOT NULL DEFAULT 0 CHECK (count > 0),
-                          last_msg_id  INTEGER NOT NULL DEFAULT 0 CHECK (last_msg_id > 0),
+                          count        INTEGER NOT NULL DEFAULT 0 CHECK (count >= 0),
+                          last_msg_id  INTEGER NOT NULL DEFAULT 0 CHECK (last_msg_id >= 0),
                           in_whitelist INTEGER NOT NULL DEFAULT 0 CHECK (in_whitelist IN (0, 1)),
                           PRIMARY KEY (group_id, pic_dhash)
                       ) WITHOUT ROWID;''')
