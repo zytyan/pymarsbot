@@ -446,6 +446,75 @@ async def cmd_welcome(update: Update, _ctx):
     await send_welcome(update.get_bot(), update.effective_chat.id)
 
 
+def export(chat_id: int):
+    rows = conn.cursor().execute(
+        '''SELECT group_id, pic_dhash, count, last_msg_id, in_whitelist
+           FROM mars_info
+           WHERE group_id = ?''', (chat_id,))
+    filename = f'mars-export_{chat_id}.csv'
+    with open(filename, 'w') as f:
+        f.write('group_id,pic_dhash,count,last_msg_id,in_whitelist\n')
+        for row in rows:
+            f.write("{},{},{},{},{}\n".format(row[0], row[1].hex(), row[2], row[3], row[4]))
+    return filename
+
+
+@dataclass
+class ExportingChat:
+    chat_id: int
+    time: float
+    running: bool = False
+
+
+_exporting_chat: dict[int, ExportingChat] = {}
+
+
+async def export_data(update: Update, _ctx):
+    chat_id = update.effective_chat.id
+    if exporting := _exporting_chat.get(chat_id):
+        if exporting.running:
+            await update.effective_message.reply_text('当前正在导出数据，请稍候再试')
+            return
+        await update.effective_message.reply_text('请不要短时间内重复导出，每次单个群组导出冷却时间为10分钟。')
+        return
+
+    async def delete_exporting():
+        await asyncio.sleep(10 * 60)
+        _exporting_chat.pop(chat_id, None)
+
+    _exporting_chat[chat_id] = ExportingChat(chat_id, time.time(), True)
+    filename = await asyncio.to_thread(export, chat_id)
+    await update.effective_message.reply_document(filename)
+    out_filename = filename
+    try:
+        tar_filename = f"{filename}.tar.gz"
+        proc = await asyncio.create_subprocess_exec("tar", "-zcf", tar_filename, out_filename)
+        result = await proc.wait()
+        if result == 0:
+            os.remove(out_filename)
+            out_filename = tar_filename
+    except FileNotFoundError:
+        pass
+    try:
+        await update.effective_message.reply_document(out_filename)
+    except Exception as e:
+        print(e)
+        _exporting_chat.pop(chat_id, None)
+        await update.effective_message.reply_text(f'导出失败，错误: {e}')
+    finally:
+        _exporting_chat[chat_id].running = False
+        os.remove(out_filename)
+    asyncio.create_task(delete_exporting())
+
+
+async def export_help(update: Update, _ctx):
+    await update.message.reply_text('想部署自己的火星车，又放不下当前数据？\n'
+                                    '现在，您可以使用命令 /ensure_marsbot_export 导出火星车的数据，它们包括'
+                                    '群组ID、DHASH值、火星数量、上一次消息ID及白名单状态\n'
+                                    '这些信息将会被导出为tar压缩的csv格式，您可以在解压后放心地直接使用逗号分割。\n'
+                                    '请注意，为避免无意义的性能消耗，每个群组在十分钟内只能导出一次。')
+
+
 def main():
     builder = Application.builder()
     if not os.getenv("BOT_TOKEN"):
@@ -469,6 +538,9 @@ def main():
     application.add_handler(CommandHandler("start", bot_help))
     application.add_handler(CommandHandler("stat", bot_stat))
     application.add_handler(CommandHandler("mars_bot_welcome", cmd_welcome))
+    application.add_handler(CommandHandler("ensure_marsbot_export", export_data))
+    application.add_handler(CommandHandler("export", export_help))
+
     application.add_handler(ChatMemberHandler(welcome))
     application.run_polling(
         allowed_updates=[
