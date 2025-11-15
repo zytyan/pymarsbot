@@ -481,6 +481,7 @@ async def export_data(update: Update, _ctx):
 
     async def delete_exporting():
         await asyncio.sleep(10 * 60)
+        print(f"delete exporting chat id={chat_id}")
         _exporting_chat.pop(chat_id, None)
 
     _exporting_chat[chat_id] = ExportingChat(chat_id, time.time(), True)
@@ -504,9 +505,10 @@ async def export_data(update: Update, _ctx):
     finally:
         _exporting_chat[chat_id].running = False
         os.remove(out_filename)
-    task = asyncio.create_task(delete_exporting())
+    task = asyncio.create_task(delete_exporting(), name=f'export {chat_id} mars info')
 
     def done(f):
+        print(f"future {f} done\n")
         if f.exception() is not None:
             print(f.exception())
 
