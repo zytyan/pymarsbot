@@ -470,7 +470,7 @@ def main():
     application.add_handler(CommandHandler("help", bot_help))
     application.add_handler(CommandHandler("start", bot_help))
     application.add_handler(CommandHandler("stat", bot_stat))
-    application.add_handler(CommandHandler("mars_bot_welcome", bot_stat))
+    application.add_handler(CommandHandler("mars_bot_welcome", cmd_welcome))
     application.add_handler(ChatMemberHandler(welcome))
     application.run_polling(
         allowed_updates=[
