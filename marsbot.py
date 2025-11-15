@@ -191,6 +191,8 @@ async def reply_one_photo(msg: Message):
     chat_id = msg.chat_id
     dhash = await get_dhash(conn.cursor(), msg.get_bot(), msg.photo[-1])
     mars_info = MarsInfo.query_or_default(conn.cursor(), chat_id, dhash)
+    if mars_info.last_msg_id == msg.id:
+        return
     if not mars_info.in_whitelist and mars_info.count > 0:
         reply_markup = None
         if mars_info.count > 5:
@@ -211,7 +213,8 @@ async def reply_photo(update: Update, _ctx):
         return
     print(f"尝试处理含图片消息 {update.effective_chat.id}/{update.effective_message.id}")
     if update.effective_message.media_group_id:
-        await reply_grouped_photo(update.effective_message)
+        if not update.edited_message:
+            await reply_grouped_photo(update.effective_message)
     else:
         await reply_one_photo(update.effective_message)
 
