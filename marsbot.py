@@ -383,7 +383,7 @@ async def remove_from_whitelist(update: Update, _ctx):
         return
     dhash = await get_dhash(conn.cursor(), update.get_bot(), photo)
     mars_info = MarsInfo.query_or_default(conn.cursor(), update.effective_message.chat_id, dhash)
-    if mars_info.in_whitelist:
+    if not mars_info.in_whitelist:
         await update.effective_message.reply_text('这张图片并不在白名单中',
                                                   reply_to_message_id=update.effective_message.message_id)
         return
