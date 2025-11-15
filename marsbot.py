@@ -430,7 +430,6 @@ def main():
 
 if __name__ == '__main__':
     try:
-        # main()
-        backup_database()
+        main()
     finally:
         conn.commit()
