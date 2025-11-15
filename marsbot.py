@@ -259,7 +259,9 @@ async def grouped_media_proc(msg_queue: asyncio.Queue[Message], media_group_id) 
     try:
         for msg, dhash in zip(msg_list, dhash_list, strict=True):
             mars_info = MarsInfo.query_or_default(conn.cursor(), msg.chat_id, dhash)
-            if not mars_info.in_whitelist and mars_info.count > 0:
+            if mars_info.in_whitelist:
+                continue
+            if mars_info.count > 0:
                 await msg.reply_html(build_mars_reply_grouped(msg.chat, mars_info), reply_to_message_id=msg.message_id)
                 mars_info.count += 1
                 mars_info.last_msg_id = msg.id
@@ -295,7 +297,9 @@ async def reply_one_photo(msg: Message):
     mars_info = MarsInfo.query_or_default(conn.cursor(), chat_id, dhash)
     if mars_info.last_msg_id == msg.id:
         return
-    if not mars_info.in_whitelist and mars_info.count > 0:
+    if mars_info.in_whitelist:
+        return
+    if mars_info.count > 0:
         reply_markup = None
         if mars_info.count > 5:
             reply_markup = InlineKeyboardMarkup(
