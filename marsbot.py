@@ -1,8 +1,8 @@
 import asyncio
 import io
-import logging
 import os
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from weakref import WeakValueDictionary
@@ -12,11 +12,97 @@ import numpy as np
 from telegram import Update, Chat, PhotoSize, Message, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, filters, CommandHandler, CallbackQueryHandler
 
-import config
-from config import conn
 
-logging.basicConfig(format='[%(levelname) 5s/%(asctime)s] %(name)s: %(message)s',
-                    level=logging.WARNING)
+def init_database(connection: sqlite3.Connection):
+    cursor = connection.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS mars_info
+                      (
+                          group_id     INTEGER NOT NULL,
+                          pic_dhash    BLOB    NOT NULL,
+                          count        INTEGER NOT NULL DEFAULT 0 CHECK (count > 0),
+                          last_msg_id  INTEGER NOT NULL DEFAULT 0 CHECK (last_msg_id > 0),
+                          in_whitelist INTEGER NOT NULL DEFAULT 0 CHECK (in_whitelist IN (0, 1)),
+                          PRIMARY KEY (group_id, pic_dhash)
+                      ) WITHOUT ROWID;''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS fuid_to_dhash
+                      (
+                          fuid  TEXT PRIMARY KEY NOT NULL,
+                          dhash BLOB             NOT NULL
+                      ) WITHOUT ROWID;''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS group_user_in_whitelist
+                      (
+                          group_id INTEGER NOT NULL,
+                          user_id  INTEGER NOT NULL,
+                          PRIMARY KEY (group_id, user_id)
+                      ) WITHOUT ROWID;''')
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA synchronous=OFF")
+    cursor.execute("PRAGMA cache_size=-20000;")
+    connection.commit()
+
+
+conn = sqlite3.connect('mars.db')
+init_database(conn)
+
+
+def backup_database():
+    print("Backing up database...")
+    filename = 'backup_mars_at_{}.db'.format(time.strftime("%Y-%m-%d-%H_%M_%S"))
+    backup = sqlite3.connect(filename)
+    with backup:
+        conn.backup(backup)
+    backup.close()
+    s3_api = os.getenv("S3_API_ENDPOINT")
+    if not s3_api:
+        print("没有配置 S3_API_ENDPOINT ，仅将文件备份在本地。")
+        return
+    key_id = os.getenv("S3_API_KEY_ID")
+    if not key_id:
+        print("配置了S3存储用于备份，但没有提供key id，无法上传，请确认您配置了环境变量 S3_API_KEY_ID")
+        return
+    key_secret = os.getenv("S3_API_KEY_SECRET")
+    if not key_secret:
+        print("配置了S3存储用于备份，但没有提供secret key，无法上传，请确认您配置了环境变量 S3_API_KEY_SECRET")
+        return
+    bucket = os.getenv("S3_BUCKET")
+    if not bucket:
+        print("没有配置 S3_BUCKET, 程序无法确定使用哪个存储桶")
+        return
+    import boto3
+    print(f"开始向S3备份，API={s3_api}, key={key_id}, secret={key_secret[:2]}***{key_secret[-2:]}")
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=s3_api,
+        aws_access_key_id=key_id,
+        aws_secret_access_key=key_secret,
+    )
+    s3.upload_file(filename, bucket, filename)
+    os.remove(filename)
+
+
+def start_backup_thread():
+    if os.getenv("NO_BACKUP"):
+        print("检测到 NO_BACKUP 环境变量，不备份数据库")
+        return
+    print("通过配置 NO_BACKUP 环境环境变量避免备份数据库")
+    try:
+        interval_minutes = float(os.getenv("BACKUP_INTERVAL_MINUTES"))
+    except ValueError:
+        print("未配置备份间隔环境变量 BACKUP_INTERVAL_MINUTES 或备份间隔解析失败，使用默认间隔（12小时）")
+        interval_minutes = 720
+
+    def inner():
+        while True:
+            try:
+                backup_database()
+                time.sleep(interval_minutes * 60)
+            except KeyboardInterrupt:
+                return
+            except Exception as e:
+                print(e)
+
+    thread = threading.Thread(target=inner, daemon=True)
+    thread.start()
 
 
 def dhash_bytes(data: bytes) -> bytes:
@@ -226,8 +312,9 @@ async def get_refer_photo(update: Update):
     elif update.effective_message.reply_to_message and update.effective_message.reply_to_message.photo:
         photo = update.effective_message.reply_to_message.photo[-1]
     if not photo:
-        await update.effective_message.reply_text('火星车没有发现您引用了任何图片。\n尝试发送图片使用命令，或回复特定图片。',
-                                        reply_to_message_id=update.effective_message.message_id)
+        await update.effective_message.reply_text(
+            '火星车没有发现您引用了任何图片。\n尝试发送图片使用命令，或回复特定图片。',
+            reply_to_message_id=update.effective_message.message_id)
         return None
     return photo
 
@@ -249,10 +336,10 @@ async def get_pic_info(update: Update, _ctx):
     mars_info = MarsInfo.query_or_default(conn.cursor(), update.effective_message.chat_id, dhash)
     whitelist_str = '🙈 它在本群的火星白名单中' if mars_info.in_whitelist else '🟢 它不在本群的火星白名单当中'
     await update.effective_message.reply_text(f'File unique id: {photo.file_unique_id}\n'
-                                    f'dhash: {dhash.hex().upper()}\n'
-                                    f'在本群的火星次数:{mars_info.count}\n'
-                                    f'{whitelist_str}',
-                                    reply_to_message_id=update.effective_message.message_id)
+                                              f'dhash: {dhash.hex().upper()}\n'
+                                              f'在本群的火星次数:{mars_info.count}\n'
+                                              f'{whitelist_str}',
+                                              reply_to_message_id=update.effective_message.message_id)
 
 
 async def add_to_whitelist(update: Update, _ctx):
@@ -262,27 +349,32 @@ async def add_to_whitelist(update: Update, _ctx):
     dhash = await get_dhash(conn.cursor(), update.get_bot(), photo)
     mars_info = MarsInfo.query_or_default(conn.cursor(), update.effective_message.chat_id, dhash)
     if mars_info.in_whitelist:
-        await update.effective_message.reply_text('这张图片已经在白名单当中了', reply_to_message_id=update.effective_message.message_id)
+        await update.effective_message.reply_text('这张图片已经在白名单当中了',
+                                                  reply_to_message_id=update.effective_message.message_id)
         return
     mars_info.in_whitelist = True
     mars_info.upsert(conn.cursor())
-    await update.effective_message.reply_text('成功将图片加入白名单', reply_to_message_id=update.effective_message.message_id)
+    await update.effective_message.reply_text('成功将图片加入白名单',
+                                              reply_to_message_id=update.effective_message.message_id)
 
 
 async def remove_from_whitelist(update: Update, _ctx):
     photo = await get_refer_photo(update)
     if not photo:
-        await update.effective_message.reply_text('火星车没有发现您引用了任何图片。\n尝试发送图片使用命令，或回复特定图片。',
-                                        reply_to_message_id=update.effective_message.message_id)
+        await update.effective_message.reply_text(
+            '火星车没有发现您引用了任何图片。\n尝试发送图片使用命令，或回复特定图片。',
+            reply_to_message_id=update.effective_message.message_id)
         return
     dhash = await get_dhash(conn.cursor(), update.get_bot(), photo)
     mars_info = MarsInfo.query_or_default(conn.cursor(), update.effective_message.chat_id, dhash)
     if mars_info.in_whitelist:
-        await update.effective_message.reply_text('这张图片并不在白名单中', reply_to_message_id=update.effective_message.message_id)
+        await update.effective_message.reply_text('这张图片并不在白名单中',
+                                                  reply_to_message_id=update.effective_message.message_id)
         return
     mars_info.in_whitelist = False
     mars_info.upsert(conn.cursor())
-    await update.effective_message.reply_text('成功将图片移除白名单', reply_to_message_id=update.effective_message.message_id)
+    await update.effective_message.reply_text('成功将图片移除白名单',
+                                              reply_to_message_id=update.effective_message.message_id)
 
 
 async def bot_help(update: Update, _ctx):
@@ -300,13 +392,17 @@ async def bot_help(update: Update, _ctx):
 
 def main():
     builder = Application.builder()
-    builder.token(config.BOT_TOKEN)
+    if not os.getenv("BOT_TOKEN"):
+        print("需要配置环境变量 BOT_TOKEN, 请使用 export BOT_TOKEN=<YOUR_BOT_TOKEN> 来配置")
+        exit(1)
+    builder.token(os.getenv("BOT_TOKEN"))
     if base_url := os.getenv('BOT_BASE_URL'):
         builder.base_url(base_url)
     if base_file_url := os.getenv('BOT_BASE_FILE_URL'):
         builder.base_file_url(base_file_url)
     if proxy := os.getenv('BOT_PROXY'):
         builder.proxy(proxy)
+    start_backup_thread()
     application = builder.build()
     application.add_handler(MessageHandler(filters.PHOTO, reply_photo))
     application.add_handler(CallbackQueryHandler(add_pic_whitelist_by_cb, r'^wl:[\da-fA-F]+$'))
@@ -314,7 +410,15 @@ def main():
     application.add_handler(CommandHandler("add_whitelist", add_to_whitelist))
     application.add_handler(CommandHandler("remove_whitelist", remove_from_whitelist))
     application.add_handler(CommandHandler("help", bot_help))
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_polling(
+        allowed_updates=[
+            # 用于处理bot的按钮
+            Update.CALLBACK_QUERY,
+            # 处理群组消息
+            Update.CHANNEL_POST, Update.MESSAGE, Update.EDITED_MESSAGE,
+            # 将来bot被加入到群组时可以回应
+            Update.MY_CHAT_MEMBER
+        ])
 
 
 if __name__ == '__main__':
