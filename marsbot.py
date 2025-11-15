@@ -55,6 +55,7 @@ def backup_database():
     import zstd
     zstd_filename = filename + '.zstd'
     with open(filename, 'rb') as fi, open(zstd_filename, 'wb') as fo:
+        # noinspection PyTypeChecker
         fo.write(zstd.compress(fi.read(), 5, max(1, os.cpu_count() - 2)))
     os.remove(filename)
     s3_api = os.getenv("S3_API_ENDPOINT")
@@ -385,15 +386,18 @@ async def remove_from_whitelist(update: Update, _ctx):
 
 
 async def bot_stat(update: Update, _ctx):
-    msg = update.message
+    msg = update.effective_message
+    user = update.effective_user
     start = time.perf_counter_ns()
     group_count = conn.execute('SELECT COUNT(DISTINCT group_id) FROM mars_info WHERE group_id < 0').fetchone()[0]
     mars_count = conn.execute('SELECT COUNT(pic_dhash) FROM mars_info WHERE group_id=?', (msg.chat_id,)).fetchone()[0]
+    exists = '在' if is_user_in_whitelist(conn.cursor(), msg.chat.id, user.id) else '不在'
     end = time.perf_counter_ns()
     await msg.reply_text(f'火星车当前一共服务了{group_count}个群组\n'
                          f'当前群组ID: {msg.chat_id}\n'
+                         f'您是 {user.full_name}(id:{user.id})，您{exists}本群的白名单当中\n'
                          f'本群一共记录了 {mars_count} 张不同的图片\n'
-                         f'本次统计共耗时 {(end - start) / 1000_000} ms\n'
+                         f'本次统计共耗时 {(end - start) / 1_000_000} ms\n'
                          f'火星车与您同在')
 
 
@@ -523,6 +527,32 @@ async def export_help(update: Update, _ctx):
                                     '请注意，为避免无意义的性能消耗，每个群组在十分钟内只能导出一次。')
 
 
+async def add_user_to_whitelist(update: Update, _ctx):
+    group_id = update.effective_chat.id
+    user = update.effective_user
+    try:
+        conn.execute('''INSERT INTO group_user_in_whitelist(group_id, user_id)
+                        VALUES (?, ?)''', (group_id, user.id))
+        await update.effective_message.reply_text(f'已将用户 {user.full_name} 加入白名单，您发的任何图片都不会被处理。')
+    except sqlite3.IntegrityError:
+        await update.effective_message.reply_text(
+            f'用户 {user.full_name} 已经在本群的白名单中，您发的任何图片都不会被处理。')
+
+
+async def remove_user_from_whitelist(update: Update, _ctx):
+    group_id = update.effective_chat.id
+    user = update.effective_user
+    cur = conn.cursor()
+    cur.execute('''DELETE
+                   FROM group_user_in_whitelist
+                   WHERE group_id = ?
+                     AND user_id = ?''', (group_id, user.id))
+    if cur.rowcount == 0:
+        await update.effective_message.reply_text(f'用户 {user.full_name} 不在本群白名单中，火星车正在工作。')
+        return
+    await update.effective_message.reply_text(f'已将用户 {user.full_name} 移除本群白名单，火星车会继续为您服务。')
+
+
 def main():
     builder = Application.builder()
     if not os.getenv("BOT_TOKEN"):
@@ -542,6 +572,8 @@ def main():
     application.add_handler(CommandHandler("pic_info", get_pic_info))
     application.add_handler(CommandHandler("add_whitelist", add_to_whitelist))
     application.add_handler(CommandHandler("remove_whitelist", remove_from_whitelist))
+    application.add_handler(CommandHandler("add_me_to_whitelist", add_user_to_whitelist))
+    application.add_handler(CommandHandler("remove_me_from_whitelist", remove_user_from_whitelist))
     application.add_handler(CommandHandler("help", bot_help))
     application.add_handler(CommandHandler("start", bot_help))
     application.add_handler(CommandHandler("stat", bot_stat))
