@@ -87,7 +87,7 @@ def start_backup_thread():
     print("通过配置 NO_BACKUP 环境环境变量避免备份数据库")
     try:
         interval_minutes = float(os.getenv("BACKUP_INTERVAL_MINUTES"))
-    except ValueError:
+    except (ValueError, TypeError):
         print("未配置备份间隔环境变量 BACKUP_INTERVAL_MINUTES 或备份间隔解析失败，使用默认间隔（12小时）")
         interval_minutes = 720
 
