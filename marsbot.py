@@ -195,7 +195,8 @@ async def get_dhash(cursor, bot, photo: PhotoSize):
     await file.download_to_memory(buf)
     dhash = dhash_bytes(buf.getvalue())
     cursor.execute('''INSERT INTO fuid_to_dhash (fuid, dhash)
-                      VALUES (?, ?)''', (photo.file_unique_id, dhash))
+                      VALUES (?, ?)
+                      ON CONFLICT DO NOTHING ''', (photo.file_unique_id, dhash))
     cursor.connection.commit()
     return dhash
 
@@ -237,48 +238,55 @@ def build_mars_reply_grouped(chat: Chat, mars_info: MarsInfo) -> str:
         return f'火星之王，收了你的神通吧，这些图都让您{label_start}火星{mars_info.count}次{label_end}了！'
 
 
-_grouped_media: dict[str, list[Message]] = {}
+_grouped_media: dict[str, asyncio.Queue[Message]] = {}
 
 
-async def msg_queue(msg_list: list[Message]):
-    length = len(msg_list)
-    for i in range(5):
-        await asyncio.sleep(1.5)
-        if len(msg_list) == length:
+async def grouped_media_proc(msg_queue: asyncio.Queue[Message], media_group_id) -> None:
+    msg_list = []
+    for i in range(10):
+        try:
+            msg = await asyncio.wait_for(msg_queue.get(), timeout=1.5)
+            msg_list.append(msg)
+        except asyncio.TimeoutError:
             break
-        length = len(msg_list)
-    msg = msg_list[0]
+    dhash_list = []
+    for msg in msg_list:
+        if not msg.photo:
+            continue
+        dhash_list.append(
+            await get_dhash(conn.cursor(), msg.get_bot(), msg.photo[-1])
+        )
     try:
-        dhash_list = []
-        for m in msg_list:
-            if not m.photo:
-                continue
-            dhash_list.append(
-                await get_dhash(conn.cursor(), msg.get_bot(), m.photo[-1])
-            )
-        for i, dhash in enumerate(dhash_list):
+        for msg, dhash in zip(msg_list, dhash_list, strict=True):
             mars_info = MarsInfo.query_or_default(conn.cursor(), msg.chat_id, dhash)
-            msg = msg_list[i]
             if not mars_info.in_whitelist and mars_info.count > 0:
                 await msg.reply_html(build_mars_reply_grouped(msg.chat, mars_info), reply_to_message_id=msg.message_id)
                 mars_info.count += 1
-                mars_info.last_msg_id = msg_list[i].id
+                mars_info.last_msg_id = msg.id
                 mars_info.upsert(conn.cursor())
                 break
             mars_info.count += 1
-            mars_info.last_msg_id = msg.chat_id
+            mars_info.last_msg_id = msg.id
             mars_info.upsert(conn.cursor())
     finally:
-        del _grouped_media[msg.media_group_id]
+        del _grouped_media[media_group_id]
 
 
 async def reply_grouped_photo(msg: Message):
     if msg.media_group_id in _grouped_media:
-        _grouped_media[msg.media_group_id].append(msg)
+        _grouped_media[msg.media_group_id].put_nowait(msg)
         return
-    msg_list = [msg]
+    msg_list = asyncio.Queue(maxsize=10)  # telegram 最多支持10个Photo消息，那我做10个总归是不会有问题
+    msg_list.put_nowait(msg)
     _grouped_media[msg.media_group_id] = msg_list
-    asyncio.create_task(msg_queue(msg_list), name=f"msg_queue[{msg.media_group_id}]")
+    task = asyncio.create_task(grouped_media_proc(msg_list, msg.media_group_id),
+                               name=f"grouped_media_proc[{msg.media_group_id}]")
+
+    def done(f: asyncio.Task[None]):
+        if f.exception():
+            print(f'coro:{f.get_name()} exception:{f.exception()}')
+
+    task.add_done_callback(done)
 
 
 async def reply_one_photo(msg: Message):
