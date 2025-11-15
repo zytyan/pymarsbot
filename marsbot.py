@@ -384,6 +384,19 @@ async def remove_from_whitelist(update: Update, _ctx):
                                               reply_to_message_id=update.effective_message.message_id)
 
 
+async def bot_stat(update: Update, _ctx):
+    msg = update.message
+    start = time.perf_counter_ns()
+    group_count = conn.execute('SELECT COUNT(DISTINCT group_id) FROM mars_info WHERE group_id < 0').fetchone()[0]
+    mars_count = conn.execute('SELECT COUNT(pic_dhash) FROM mars_info WHERE group_id=?', (msg.chat_id,)).fetchone()[0]
+    end = time.perf_counter_ns()
+    await msg.reply_text(f'火星车当前一共服务了{group_count}个群组\n'
+                         f'当前群组ID: {msg.chat_id}\n'
+                         f'本群一共记录了 {mars_count} 张不同的图片\n'
+                         f'本次统计共耗时 {(end - start) / 1000} us\n'
+                         f'火星车与您同在')
+
+
 async def bot_help(update: Update, _ctx):
     bot_name = update.get_bot().username
     at_suffix = f'@{bot_name}'
@@ -417,6 +430,7 @@ def main():
     application.add_handler(CommandHandler("add_whitelist", add_to_whitelist))
     application.add_handler(CommandHandler("remove_whitelist", remove_from_whitelist))
     application.add_handler(CommandHandler("help", bot_help))
+    application.add_handler(CommandHandler("stat", bot_stat))
     application.run_polling(
         allowed_updates=[
             # 用于处理bot的按钮
