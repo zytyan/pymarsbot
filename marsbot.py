@@ -41,7 +41,7 @@ def init_database(connection: sqlite3.Connection):
     connection.commit()
 
 
-conn = sqlite3.connect('mars.db')
+conn = sqlite3.connect('mars.db', check_same_thread=False)
 init_database(conn)
 
 
@@ -100,6 +100,8 @@ def start_backup_thread():
                 return
             except Exception as e:
                 print(e)
+                # 出现错误十分钟后重试
+                time.sleep(600)
 
     thread = threading.Thread(target=inner, daemon=True, name="db_backup_thread")
     thread.start()
