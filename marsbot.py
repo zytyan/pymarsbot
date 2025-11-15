@@ -416,6 +416,8 @@ async def bot_help(update: Update, _ctx):
         f'/pic_info{at_suffix} 获取图片信息\n'
         f'/add_whitelist{at_suffix} 将图片添加到白名单\n'
         f'/remove_from_whitelist{at_suffix} 将图片移除白名单\n'
+        f'/add_me_to_whitelist{at_suffix} 将用户加入群组白名单\n'
+        f'/remove_me_from_whitelist{at_suffix} 将用户移出群组白名单\n'
         f'/export{at_suffix} 导出本聊天中火星车的数据')
 
 
@@ -424,7 +426,7 @@ async def send_welcome(bot, chat_id):
         chat_id,
         '欢迎使用火星车。\n'
         '本bot为 @Ytyan 为其群组开发的重复图片检测工具\n'
-        '当您将火星车加入群组或频道中后，火星车将自动开始工作。bot会读取群组中的图片，将其转换为DHASH，当检测到重复图片时，会回复图片的发送者。\n'
+        '当您将火星车加入群组或频道中后，火星车将自动开始工作。bot会实时检测群组中的图片，将其转换为DHASH，当检测到重复图片时，会回复图片的发送者。\n'
         'bot会收集并持久保存工作需要的必要信息，包括群组ID、图片唯一ID、图片DHASH和携带图片的消息的ID。bot会在必要时下载图片，但不会持久保存\n'
         'bot只会检查普通图片，文件形式的图片、表情包、视频等均不会被检测。\n'
         '本bot为开源项目，您可以前往<a href="https://github.com/zytyan/pymarsbot">Github开源地址</a>自行克隆该项目。',
