@@ -607,6 +607,7 @@ async def find_similar_img_by_cb(update: Update, _ctx):
             f'{label_start}图片{i + 1}: 距离: {hamming_distance(dhash, mars_info.pic_dhash)} 消息ID: {mars_info.last_msg_id}{label_end}'
         )
     await update.effective_message.reply_html('\n'.join(text_buf))
+    await update.callback_query.answer(f'查找完成', show_alert=False)
 
 
 def main():
