@@ -429,7 +429,7 @@ async def bot_stat(update: Update, _ctx):
     exists = '在' if is_user_in_whitelist(conn.cursor(), msg.chat.id, user.id) else '不在'
     end = time.perf_counter_ns()
     await msg.reply_text(f'火星车当前一共服务了{group_count}个群组\n'
-                         f'当前群组ID: {msg.chat_id}\n'
+                         f'当前群组{msg.chat.effective_name}(ID:{msg.chat_id})\n'
                          f'您是 {user.full_name}(id:{user.id})，您{exists}本群的白名单当中\n'
                          f'本群一共记录了 {mars_count} 张不同的图片\n'
                          f'本次统计共耗时 {(end - start) / 1_000_000} ms\n'
