@@ -5,12 +5,18 @@ import sqlite3
 import threading
 import time
 from dataclasses import dataclass
-from weakref import WeakValueDictionary
 
 import cv2
 import numpy as np
 from telegram import Update, Chat, PhotoSize, Message, InlineKeyboardButton, InlineKeyboardMarkup, ChatMember
 from telegram.ext import Application, MessageHandler, filters, CommandHandler, CallbackQueryHandler, ChatMemberHandler
+
+
+def hamming_distance(a: bytes, b: bytes) -> int:
+    x = int.from_bytes(a, "big")
+    y = int.from_bytes(b, "big")
+    n = (x ^ y).bit_count()
+    return n
 
 
 def init_database(connection: sqlite3.Connection):
@@ -37,7 +43,8 @@ def init_database(connection: sqlite3.Connection):
                       ) WITHOUT ROWID;''')
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA synchronous=OFF")
-    cursor.execute("PRAGMA cache_size=-20000;")
+    cursor.execute("PRAGMA cache_size=-80000;")
+    connection.create_function('hamming_distance', 2, hamming_distance)
     connection.commit()
 
 
@@ -123,9 +130,6 @@ def dhash_bytes(data: bytes) -> bytes:
     return dhash
 
 
-_mars_cache = WeakValueDictionary()
-
-
 @dataclass(slots=True, weakref_slot=True)
 class MarsInfo:
     group_id: int
@@ -136,9 +140,6 @@ class MarsInfo:
 
     @staticmethod
     def query_or_default(cursor: sqlite3.Cursor, group_id: int, dhash: bytes) -> 'MarsInfo':
-        tmp = _mars_cache.get((group_id, dhash))
-        if tmp is not None:
-            return tmp
         start = time.perf_counter_ns()
         row = cursor.execute(
             '''SELECT group_id, pic_dhash, count, last_msg_id, in_whitelist
@@ -152,7 +153,6 @@ class MarsInfo:
             info = MarsInfo(group_id=group_id, pic_dhash=dhash, count=0, last_msg_id=0, in_whitelist=False)
         else:
             info = MarsInfo(*row)
-        _mars_cache[(group_id, dhash)] = info
         return info
 
     def upsert(self, cursor: sqlite3.Cursor):
@@ -172,6 +172,23 @@ class MarsInfo:
         end = time.perf_counter_ns()
         print("upsert one data time elapsed: {} us".format((end - start) / 1000))
         cursor.connection.commit()
+
+    @staticmethod
+    def find_similar(cursor: sqlite3.Cursor, group_id: int, dhash: bytes, threshold) -> list['MarsInfo']:
+        rows = cursor.execute('''
+                              SELECT group_id, pic_dhash, count, last_msg_id, in_whitelist
+                              FROM (SELECT group_id,
+                                           pic_dhash,
+                                           count,
+                                           last_msg_id,
+                                           in_whitelist,
+                                           hamming_distance(pic_dhash, ?) AS hd
+                                    FROM mars_info
+                                    WHERE group_id = ?)
+                              WHERE hd < ?
+                              ORDER BY hd
+                              LIMIT 10''', (dhash, group_id, threshold))
+        return [MarsInfo(*row) for row in rows]
 
 
 def get_dhash_from_fuid(cursor: sqlite3.Cursor, fuid: str) -> bytes | None:
@@ -314,10 +331,12 @@ async def reply_one_photo(msg: Message):
 
 
 async def reply_photo(update: Update, _ctx):
+    chat = update.effective_chat
+    user = update.effective_user
     if is_user_in_whitelist(conn.cursor(), update.effective_chat.id, update.effective_user.id):
-        print(f"user {update.effective_chat.id}/{update.effective_user.id} 在白名单中，忽略")
+        print(f"user {chat.effective_name}({chat.id})/{user.full_name}({user.id}) 在白名单中，忽略")
         return
-    print(f"尝试处理含图片消息 {update.effective_chat.id}/{update.effective_message.id}")
+    print(f"尝试处理含图片消息 {chat.effective_name}({chat.id})/{user.full_name}({user.id})")
     if update.effective_message.media_group_id:
         if not update.edited_message:
             await reply_grouped_photo(update.effective_message)
@@ -355,11 +374,15 @@ async def get_pic_info(update: Update, _ctx):
     dhash = await get_dhash(conn.cursor(), update.get_bot(), photo)
     mars_info = MarsInfo.query_or_default(conn.cursor(), update.effective_message.chat_id, dhash)
     whitelist_str = '🙈 它在本群的火星白名单中' if mars_info.in_whitelist else '🟢 它不在本群的火星白名单当中'
+    reply_markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton("查找DHASH相似图片", callback_data=f'find:{mars_info.pic_dhash.hex()}'),
+    ]])
     await update.effective_message.reply_text(f'File unique id: {photo.file_unique_id}\n'
                                               f'dhash: {dhash.hex().upper()}\n'
                                               f'在本群的火星次数:{mars_info.count}\n'
                                               f'{whitelist_str}',
-                                              reply_to_message_id=update.effective_message.message_id)
+                                              reply_to_message_id=update.effective_message.message_id,
+                                              reply_markup=reply_markup)
 
 
 async def add_to_whitelist(update: Update, _ctx):
@@ -567,6 +590,25 @@ async def remove_user_from_whitelist(update: Update, _ctx):
     await update.effective_message.reply_text(f'已将用户 {user.full_name} 移除本群白名单，火星车会继续为您服务。')
 
 
+async def find_similar_img_by_cb(update: Update, _ctx):
+    start = time.perf_counter_ns()
+    chat_id = update.effective_chat.id
+    dhash = bytes.fromhex(update.callback_query.data.split(':')[1])
+
+    mars_info_list = await asyncio.to_thread(MarsInfo.find_similar, conn.cursor(), chat_id, dhash, 6)
+    end = time.perf_counter_ns()
+    head = (f'火星车为您找到了{len(mars_info_list)}张相似的图片\n'
+            f'这些图片的汉明距离小于6\n'
+            f'耗时:{(end - start) / 1000_000}ms\n')  # 这里保留一个换行符，和下面做出区别，并非出错
+    text_buf = [head]
+    for i, mars_info in enumerate(mars_info_list):
+        label_start, label_end = get_label(update.effective_chat, mars_info)
+        text_buf.append(
+            f'{label_start}图片{i + 1}: 距离: {hamming_distance(dhash, mars_info.pic_dhash)} 消息ID: {mars_info.last_msg_id}{label_end}'
+        )
+    await update.effective_message.reply_html('\n'.join(text_buf))
+
+
 def main():
     builder = Application.builder()
     if not os.getenv("BOT_TOKEN"):
@@ -583,6 +625,7 @@ def main():
     application = builder.build()
     application.add_handler(MessageHandler(filters.PHOTO, reply_photo))
     application.add_handler(CallbackQueryHandler(add_pic_whitelist_by_cb, r'^wl:[\da-fA-F]+$'))
+    application.add_handler(CallbackQueryHandler(find_similar_img_by_cb, r'^find:[\da-fA-F]+$'))
     application.add_handler(CommandHandler("pic_info", get_pic_info))
     application.add_handler(CommandHandler("add_whitelist", add_to_whitelist))
     application.add_handler(CommandHandler("remove_whitelist", remove_from_whitelist))
