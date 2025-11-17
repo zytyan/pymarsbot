@@ -325,6 +325,7 @@ async def grouped_media_proc(msg_queue: asyncio.Queue[Message]) -> None:
             asyncio.create_task(report_to_stat(msg.chat_id, mars_info.count)).add_done_callback(async_task_done)
             if final_mars_info is None or mars_info.count > final_mars_info.count:
                 final_mars_info = mars_info.clone()
+                final_msg = msg
         mars_info.count += 1
         mars_info.last_msg_id = msg.id
         mars_info.upsert(conn.cursor())
