@@ -7,6 +7,7 @@ import time
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from weakref import WeakValueDictionary
 
 import cv2
 import httpx
@@ -144,6 +145,11 @@ def dhash_bytes(data: bytes) -> bytes:
     return dhash
 
 
+# 这个是用来维护跨await时的数据库一致性的，不是缓存，不能删
+# 虽然数据库更新是原子的，但是代码不是
+_mars_info_weak_ref = WeakValueDictionary()
+
+
 @dataclass(slots=True, weakref_slot=True)
 class MarsInfo:
     group_id: int
@@ -154,6 +160,8 @@ class MarsInfo:
 
     @staticmethod
     def query_or_default(cursor: sqlite3.Cursor, group_id: int, dhash: bytes) -> 'MarsInfo':
+        if cache := _mars_info_weak_ref.get((group_id, dhash), None):
+            return cache
         start = time.perf_counter_ns()
         row = cursor.execute(
             '''SELECT group_id, pic_dhash, count, last_msg_id, in_whitelist
@@ -167,6 +175,7 @@ class MarsInfo:
             info = MarsInfo(group_id=group_id, pic_dhash=dhash, count=0, last_msg_id=0, in_whitelist=False)
         else:
             info = MarsInfo(*row)
+        _mars_info_weak_ref[(group_id, dhash)] = info
         return info
 
     def upsert(self, cursor: sqlite3.Cursor):
@@ -189,6 +198,7 @@ class MarsInfo:
 
     @staticmethod
     def find_similar(cursor: sqlite3.Cursor, group_id: int, dhash: bytes, threshold) -> list['MarsInfo']:
+        # 无论是find_similar还是clone都不需要放到一致性map里，它们不需要什么一致性
         rows = cursor.execute('''
                               SELECT group_id, pic_dhash, count, last_msg_id, in_whitelist
                               FROM (SELECT group_id,
