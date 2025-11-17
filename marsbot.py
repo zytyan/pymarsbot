@@ -239,10 +239,7 @@ if _report_stat_url:
 async def report_to_stat(group_id, mars_count):
     if not _report_stat_url:
         return
-    try:
-        await _report_http_client.post(_report_stat_url, json={'group_id': group_id, 'mars_count': mars_count})
-    except Exception as e:
-        print(e)
+    await _report_http_client.post(_report_stat_url, json={'group_id': group_id, 'mars_count': mars_count})
 
 
 async def get_dhash(cursor, bot, photo: PhotoSize):
