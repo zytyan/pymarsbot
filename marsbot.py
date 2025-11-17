@@ -4,6 +4,7 @@ import os
 import sqlite3
 import threading
 import time
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -549,8 +550,12 @@ _exporting_chat: dict[int, ExportingChat] = {}
 
 def async_task_done(t: asyncio.Task):
     print(f"task {t.get_name()} done")
-    if t.exception() is not None:
-        print(f"task {t.get_name()} : exception {t.exception()}")
+    exc = t.exception()
+    if exc is not None:
+        print(f"task {t.get_name()} : exception {exc}")
+        # 打印完整的异常栈
+        tb = exc.__traceback__
+        traceback.print_exception(type(exc), exc, tb)
 
 
 async def export_data(update: Update, _ctx):
