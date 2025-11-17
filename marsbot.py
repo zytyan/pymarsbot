@@ -5,8 +5,10 @@ import sqlite3
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 import cv2
+import httpx
 import numpy as np
 from telegram import Update, Chat, PhotoSize, Message, InlineKeyboardButton, InlineKeyboardMarkup, ChatMember
 from telegram.ext import Application, MessageHandler, filters, CommandHandler, CallbackQueryHandler, ChatMemberHandler
@@ -107,7 +109,18 @@ def start_backup_thread():
     def inner():
         while True:
             try:
-                backup_database()
+                with open("last_backup_time.txt", "a+") as f:
+                    f.seek(0)
+                    time_format = "%Y-%m-%d %H:%M:%S"
+                    try:
+                        last = datetime.strptime(f.read(), time_format)
+                    except ValueError:
+                        last = datetime.fromtimestamp(0)
+                    if datetime.now() - last > timedelta(minutes=interval_minutes):
+                        backup_database()  # 若失败应该会抛exception
+                        f.seek(0)
+                        f.write(datetime.now().strftime(time_format))
+                        f.truncate()
                 time.sleep(interval_minutes * 60)
             except KeyboardInterrupt:
                 return
@@ -190,6 +203,9 @@ class MarsInfo:
                               LIMIT 10''', (dhash, group_id, threshold))
         return [MarsInfo(*row) for row in rows]
 
+    def clone(self) -> 'MarsInfo':
+        return MarsInfo(self.group_id, self.pic_dhash, self.count, self.last_msg_id, self.in_whitelist)
+
 
 def get_dhash_from_fuid(cursor: sqlite3.Cursor, fuid: str) -> bytes | None:
     row = cursor.execute('SELECT dhash FROM fuid_to_dhash WHERE fuid=?', (fuid,)).fetchone()
@@ -201,6 +217,21 @@ def get_dhash_from_fuid(cursor: sqlite3.Cursor, fuid: str) -> bytes | None:
 def is_user_in_whitelist(cursor: sqlite3.Cursor, group_id: int, user_id: int) -> bool:
     return bool(cursor.execute('SELECT EXISTS (SELECT 1 FROM group_user_in_whitelist WHERE group_id=? AND user_id=?)',
                                (group_id, user_id)).fetchone()[0])
+
+
+_report_stat_url = os.getenv('REPORT_STAT_URL')
+_report_http_client = None
+if _report_stat_url:
+    _report_http_client = httpx.AsyncClient()
+
+
+async def report_to_stat(group_id, mars_count):
+    if not _report_stat_url:
+        return
+    try:
+        await _report_http_client.post(_report_stat_url, json={'group_id': group_id, 'mars_count': mars_count})
+    except Exception as e:
+        print(e)
 
 
 async def get_dhash(cursor, bot, photo: PhotoSize):
@@ -258,7 +289,7 @@ def build_mars_reply_grouped(chat: Chat, mars_info: MarsInfo) -> str:
 _grouped_media: dict[str, asyncio.Queue[Message]] = {}
 
 
-async def grouped_media_proc(msg_queue: asyncio.Queue[Message], media_group_id) -> None:
+async def grouped_media_proc(msg_queue: asyncio.Queue[Message]) -> None:
     msg_list = []
     for i in range(10):
         try:
@@ -273,39 +304,40 @@ async def grouped_media_proc(msg_queue: asyncio.Queue[Message], media_group_id) 
         dhash_list.append(
             await get_dhash(conn.cursor(), msg.get_bot(), msg.photo[-1])
         )
-    try:
-        for msg, dhash in zip(msg_list, dhash_list, strict=True):
-            mars_info = MarsInfo.query_or_default(conn.cursor(), msg.chat_id, dhash)
-            if mars_info.in_whitelist:
-                continue
-            if mars_info.count > 0:
-                await msg.reply_html(build_mars_reply_grouped(msg.chat, mars_info), reply_to_message_id=msg.message_id)
-                mars_info.count += 1
-                mars_info.last_msg_id = msg.id
-                mars_info.upsert(conn.cursor())
-                break
-            mars_info.count += 1
-            mars_info.last_msg_id = msg.id
-            mars_info.upsert(conn.cursor())
-    finally:
-        del _grouped_media[media_group_id]
+    final_mars_info: MarsInfo | None = None
+    final_msg: Message | None = None
+    for msg, dhash in zip(msg_list, dhash_list, strict=True):
+        mars_info = MarsInfo.query_or_default(conn.cursor(), msg.chat_id, dhash)
+        if mars_info.in_whitelist:
+            continue
+        if mars_info.count > 0:
+            asyncio.create_task(report_to_stat(msg.chat_id, mars_info.count)).add_done_callback(async_task_done)
+            if final_mars_info is None or mars_info.count > final_mars_info.count:
+                final_mars_info = mars_info.clone()
+        mars_info.count += 1
+        mars_info.last_msg_id = msg.id
+        mars_info.upsert(conn.cursor())
+    if final_mars_info:
+        await final_msg.reply_html(build_mars_reply_grouped(final_msg.chat, final_mars_info),
+                                   reply_to_message_id=final_msg.message_id)
 
 
 async def reply_grouped_photo(msg: Message):
     if msg.media_group_id in _grouped_media:
         _grouped_media[msg.media_group_id].put_nowait(msg)
         return
-    msg_list = asyncio.Queue(maxsize=10)  # telegram 最多支持10个Photo消息，那我做10个总归是不会有问题
-    msg_list.put_nowait(msg)
-    _grouped_media[msg.media_group_id] = msg_list
-    task = asyncio.create_task(grouped_media_proc(msg_list, msg.media_group_id),
+    msg_queue = asyncio.Queue(maxsize=10)  # telegram 最多支持10个Photo消息，那我做10个总归是不会有问题
+    msg_queue.put_nowait(msg)
+    _grouped_media[msg.media_group_id] = msg_queue
+    task = asyncio.create_task(grouped_media_proc(msg_queue),
                                name=f"grouped_media_proc[{msg.media_group_id}]")
+    task.add_done_callback(async_task_done)
 
-    def done(f: asyncio.Task[None]):
-        if f.exception():
-            print(f'coro:{f.get_name()} exception:{f.exception()}')
+    def del_on_end(_t):
+        # 无论是否发生异常，都要删掉这个media_group_id，避免发生内存泄漏
+        del _grouped_media[msg.media_group_id]
 
-    task.add_done_callback(done)
+    task.add_done_callback(del_on_end)
 
 
 async def reply_one_photo(msg: Message):
@@ -322,6 +354,8 @@ async def reply_one_photo(msg: Message):
             reply_markup = InlineKeyboardMarkup(
                 [[InlineKeyboardButton("将图片添加至白名单", callback_data=f'wl:{mars_info.pic_dhash.hex()}'), ]]
             )
+        asyncio.create_task(report_to_stat(msg.chat_id, mars_info.count),
+                            name=f"reply_to_stat[{mars_info.count}]").add_done_callback(async_task_done)
         await msg.reply_html(build_mars_reply(msg.chat, mars_info),
                              reply_to_message_id=msg.message_id,
                              reply_markup=reply_markup)
@@ -404,9 +438,6 @@ async def add_to_whitelist(update: Update, _ctx):
 async def remove_from_whitelist(update: Update, _ctx):
     photo = await get_refer_photo(update)
     if not photo:
-        await update.effective_message.reply_text(
-            '火星车没有发现您引用了任何图片。\n尝试发送图片使用命令，或回复特定图片。',
-            reply_to_message_id=update.effective_message.message_id)
         return
     dhash = await get_dhash(conn.cursor(), update.get_bot(), photo)
     mars_info = MarsInfo.query_or_default(conn.cursor(), update.effective_message.chat_id, dhash)
@@ -420,12 +451,13 @@ async def remove_from_whitelist(update: Update, _ctx):
                                               reply_to_message_id=update.effective_message.message_id)
 
 
-async def bot_stat(update: Update, _ctx):
+async def bot_stat_inner(update: Update):
     msg = update.effective_message
     user = update.effective_user
     start = time.perf_counter_ns()
-    group_count = conn.execute('SELECT COUNT(1) FROM mars_info WHERE group_id < 0 GROUP BY group_id').fetchone()[0]
-    mars_count = conn.execute('SELECT COUNT(1) FROM mars_info WHERE group_id=? GROUP BY pic_dhash', (msg.chat_id,)).fetchone()[0]
+    group_count = conn.execute('SELECT COUNT(DISTINCT group_id) FROM mars_info WHERE group_id < 0').fetchone()[0]
+    mars_count = conn.execute('SELECT COUNT(pic_dhash) FROM mars_info WHERE group_id=?',
+                              (msg.chat_id,)).fetchone()[0]
     exists = '在' if is_user_in_whitelist(conn.cursor(), msg.chat.id, user.id) else '不在'
     end = time.perf_counter_ns()
     await msg.reply_text(f'火星车当前一共服务了{group_count}个群组\n'
@@ -434,6 +466,10 @@ async def bot_stat(update: Update, _ctx):
                          f'本群一共记录了 {mars_count} 张不同的图片\n'
                          f'本次统计共耗时 {(end - start) / 1_000_000:.2f} ms\n'
                          f'火星车与您同在')
+
+
+async def bot_stat(update: Update, _ctx):
+    await asyncio.to_thread(bot_stat_inner, update)
 
 
 async def bot_help(update: Update, _ctx):
@@ -511,6 +547,12 @@ class ExportingChat:
 _exporting_chat: dict[int, ExportingChat] = {}
 
 
+def async_task_done(t: asyncio.Task):
+    print(f"task {t.get_name()} done")
+    if t.exception() is not None:
+        print(f"task {t.get_name()} : exception {t.exception()}")
+
+
 async def export_data(update: Update, _ctx):
     chat_id = update.effective_chat.id
     if exporting := _exporting_chat.get(chat_id):
@@ -547,13 +589,7 @@ async def export_data(update: Update, _ctx):
         _exporting_chat[chat_id].running = False
         os.remove(out_filename)
     task = asyncio.create_task(delete_exporting(), name=f'export {chat_id} mars info')
-
-    def done(f):
-        print(f"future {f} done\n")
-        if f.exception() is not None:
-            print(f.exception())
-
-    task.add_done_callback(done)
+    task.add_done_callback(async_task_done)
 
 
 async def export_help(update: Update, _ctx):
