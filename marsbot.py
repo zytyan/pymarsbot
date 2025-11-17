@@ -452,7 +452,7 @@ async def remove_from_whitelist(update: Update, _ctx):
                                               reply_to_message_id=update.effective_message.message_id)
 
 
-async def bot_stat_inner(update: Update):
+def bot_stat_inner(update: Update):
     msg = update.effective_message
     user = update.effective_user
     start = time.perf_counter_ns()
@@ -461,16 +461,17 @@ async def bot_stat_inner(update: Update):
                               (msg.chat_id,)).fetchone()[0]
     exists = '在' if is_user_in_whitelist(conn.cursor(), msg.chat.id, user.id) else '不在'
     end = time.perf_counter_ns()
-    await msg.reply_text(f'火星车当前一共服务了{group_count}个群组\n'
-                         f'当前群组ID: {msg.chat_id}\n'
-                         f'您是 {user.full_name}(id:{user.id})，您{exists}本群的白名单当中\n'
-                         f'本群一共记录了 {mars_count} 张不同的图片\n'
-                         f'本次统计共耗时 {(end - start) / 1_000_000:.2f} ms\n'
-                         f'火星车与您同在')
+    return (f'火星车当前一共服务了{group_count}个群组\n'
+            f'当前群组ID: {msg.chat_id}\n'
+            f'您是 {user.full_name}(id:{user.id})，您{exists}本群的白名单当中\n'
+            f'本群一共记录了 {mars_count} 张不同的图片\n'
+            f'本次统计共耗时 {(end - start) / 1_000_000:.2f} ms\n'
+            f'火星车与您同在')
 
 
 async def bot_stat(update: Update, _ctx):
-    await asyncio.to_thread(bot_stat_inner, update)
+    text = await asyncio.to_thread(bot_stat_inner, update)
+    await update.effective_message.reply_text(text)
 
 
 async def bot_help(update: Update, _ctx):
