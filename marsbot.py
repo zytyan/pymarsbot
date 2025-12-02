@@ -2,6 +2,7 @@ import asyncio
 import io
 import os
 import sqlite3
+import subprocess
 import threading
 import time
 import traceback
@@ -21,6 +22,18 @@ def hamming_distance(a: bytes, b: bytes) -> int:
     y = int.from_bytes(b, "big")
     n = (x ^ y).bit_count()
     return n
+
+
+def try_build_hamm_acc():
+    outfile = "hammdist.so"
+    cfile = "hammdist.c"
+    if os.path.isfile(outfile) and os.path.getmtime(outfile) > os.path.getmtime(cfile):
+        # so文件存在，且比C文件新，那么就不需要编译，否则编译一下
+        return
+    # gcc -O3 -march=native -fPIC -shared hamdist_opt.c -o hamdist_opt.so
+    subprocess.run(["gcc", "-O3", "-march=native", "-fPIC", "-shared", cfile, "-o", outfile], check=True)
+    if not os.path.isfile(outfile):
+        raise FileNotFoundError(f"{outfile} not found")
 
 
 def init_database(connection: sqlite3.Connection):
@@ -48,7 +61,14 @@ def init_database(connection: sqlite3.Connection):
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA synchronous=OFF")
     cursor.execute("PRAGMA cache_size=-80000;")
-    connection.create_function('hamming_distance', 2, hamming_distance)
+    try:
+        try_build_hamm_acc()
+        conn.enable_load_extension(True)
+        # 加载你的 hamdist.so
+        conn.load_extension("./hammdist.so")
+    except Exception as e:
+        print(f"遇到错误，使用python内建函数，错误: {e}")
+        connection.create_function('hamming_distance', 2, hamming_distance)
     connection.commit()
 
 
