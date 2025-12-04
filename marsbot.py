@@ -1,4 +1,14 @@
 import asyncio
+import logging
+import os
+import socket
+import sqlite3
+import subprocess
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from weakref import WeakValueDictionary
 
 try:
     import uvloop
@@ -7,21 +17,123 @@ try:
 except ImportError:
     pass
 import io
-import os
-import sqlite3
-import subprocess
-import threading
-import time
-import traceback
-from dataclasses import dataclass
-from datetime import datetime, timedelta
-from weakref import WeakValueDictionary
 
 import cv2
 import httpx
 import numpy as np
 from telegram import Update, Chat, PhotoSize, Message, InlineKeyboardButton, InlineKeyboardMarkup, ChatMember
 from telegram.ext import Application, MessageHandler, filters, CommandHandler, CallbackQueryHandler, ChatMemberHandler
+
+
+def setup_logging():
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = logging.getLevelNamesMapping().get(level_name, logging.INFO)
+    root = logging.getLogger()
+    root.setLevel(level)
+    if root.handlers:
+        for handler in root.handlers:
+            handler.setLevel(level)
+        return
+    try:
+        from systemd.journal import JournalHandler  # type: ignore
+
+        handler = JournalHandler()
+        handler.setLevel(level)
+        handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+        root.addHandler(handler)
+    except ImportError:
+        logging.basicConfig(level=level,
+                            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+
+setup_logging()
+logger = logging.getLogger("marsbot")
+
+
+class SystemdNotifier:
+    def __init__(self):
+        self.notify_socket = os.getenv("NOTIFY_SOCKET")
+        self.watchdog_usec = self._parse_watchdog_usec()
+        self.watchdog_pid = os.getenv("WATCHDOG_PID")
+        self._stop_event = threading.Event()
+        self._watchdog_thread: threading.Thread | None = None
+        self._notify_error_logged = False
+
+    def _parse_watchdog_usec(self) -> int:
+        raw = os.getenv("WATCHDOG_USEC")
+        if not raw:
+            return 0
+        try:
+            return int(raw)
+        except ValueError:
+            logger.warning("收到无效的 WATCHDOG_USEC 值: %s", raw)
+            return 0
+
+    def _sd_address(self) -> str | None:
+        if not self.notify_socket:
+            return None
+        if self.notify_socket.startswith("@"):
+            return "\0" + self.notify_socket[1:]
+        return self.notify_socket
+
+    def notify(self, message: str) -> bool:
+        addr = self._sd_address()
+        if not addr:
+            return False
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+                sock.connect(addr)
+                sock.sendall(message.encode())
+            logger.debug("发送 systemd notify: %s", message)
+            return True
+        except Exception:
+            if not self._notify_error_logged:
+                logger.exception("向 systemd 发送通知失败")
+                self._notify_error_logged = True
+            return False
+
+    def notify_ready(self):
+        if self.notify("READY=1"):
+            logger.info("已向 systemd 发送 READY 通知")
+
+    def notify_status(self, status: str):
+        self.notify(f"STATUS={status}")
+
+    def _get_watchdog_interval(self) -> float | None:
+        if not self.watchdog_usec or not self._sd_address():
+            return None
+        if self.watchdog_pid:
+            try:
+                if int(self.watchdog_pid) != os.getpid():
+                    return None
+            except ValueError:
+                logger.warning("收到无效的 WATCHDOG_PID 值: %s", self.watchdog_pid)
+                return None
+        interval = self.watchdog_usec / 2_000_000
+        return max(interval, 1.0)
+
+    def _watchdog_loop(self, interval: float):
+        logger.info("systemd watchdog 已启用，心跳间隔 %.2f 秒", interval)
+        while not self._stop_event.wait(interval):
+            self.notify("WATCHDOG=1")
+
+    def start_watchdog(self):
+        interval = self._get_watchdog_interval()
+        if interval is None or self._watchdog_thread:
+            return
+        self._watchdog_thread = threading.Thread(target=self._watchdog_loop,
+                                                 args=(interval,),
+                                                 daemon=True,
+                                                 name="systemd_watchdog")
+        self._watchdog_thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._watchdog_thread:
+            self._watchdog_thread.join(timeout=1)
+
+
+systemd_notifier = SystemdNotifier()
 
 
 def hamming_distance(a: bytes, b: bytes) -> int:
@@ -89,7 +201,7 @@ def init_database(connection: sqlite3.Connection):
         # 加载你的 hamdist.so
         connection.load_extension("./hammdist.so")
     except Exception as e:
-        print(f"遇到错误，使用python内建函数，错误: {e}")
+        logger.warning("加载 hammdist.so 失败，使用 python 内建函数，错误: %s", e)
         connection.create_function('hamming_distance', 2, hamming_distance)
     connection.commit()
 
@@ -112,7 +224,7 @@ def migrate_database(connection: sqlite3.Connection):
     current_version = get_meta_value(cursor, _STAT_META_KEY_VERSION, 0)
     if current_version >= LATEST_SCHEMA_VERSION:
         return
-    print(f"Migrating database: version {current_version} -> {LATEST_SCHEMA_VERSION}")
+    logger.info("迁移数据库: %s -> %s", current_version, LATEST_SCHEMA_VERSION)
     cursor.execute('DELETE FROM mars_group_stat')
     cursor.execute('DELETE FROM mars_stat_meta WHERE key != ?', (_STAT_META_KEY_VERSION,))
     cursor.execute('''INSERT INTO mars_group_stat (group_id, image_count)
@@ -159,7 +271,7 @@ migrate_database(conn)
 
 
 def backup_database():
-    print("Backing up database...")
+    logger.info("开始备份数据库")
     filename = 'backup_mars_at_{}.db'.format(time.strftime("%Y-%m-%d-%H_%M_%S"))
     backup = sqlite3.connect(filename)
     with backup:
@@ -173,22 +285,23 @@ def backup_database():
     os.remove(filename)
     s3_api = os.getenv("S3_API_ENDPOINT")
     if not s3_api:
-        print("没有配置 S3_API_ENDPOINT ，仅将文件备份在本地。")
+        logger.info("没有配置 S3_API_ENDPOINT ，仅将文件备份在本地。")
         return
     key_id = os.getenv("S3_API_KEY_ID")
     if not key_id:
-        print("配置了S3存储用于备份，但没有提供key id，无法上传，请确认您配置了环境变量 S3_API_KEY_ID")
+        logger.warning("配置了S3存储用于备份，但没有提供key id，无法上传，请确认您配置了环境变量 S3_API_KEY_ID")
         return
     key_secret = os.getenv("S3_API_KEY_SECRET")
     if not key_secret:
-        print("配置了S3存储用于备份，但没有提供secret key，无法上传，请确认您配置了环境变量 S3_API_KEY_SECRET")
+        logger.warning("配置了S3存储用于备份，但没有提供secret key，无法上传，请确认您配置了环境变量 S3_API_KEY_SECRET")
         return
     bucket = os.getenv("S3_BUCKET")
     if not bucket:
-        print("没有配置 S3_BUCKET, 程序无法确定使用哪个存储桶")
+        logger.warning("没有配置 S3_BUCKET, 程序无法确定使用哪个存储桶")
         return
     import boto3
-    print(f"开始向S3备份，API={s3_api}, key={key_id}, secret={key_secret[:2]}***{key_secret[-2:]}")
+    logger.info("开始向S3备份，API=%s, key=%s, secret=%s***%s",
+                s3_api, key_id, key_secret[:2], key_secret[-2:])
     s3 = boto3.client(
         "s3",
         endpoint_url=s3_api,
@@ -201,13 +314,13 @@ def backup_database():
 
 def start_backup_thread():
     if os.getenv("NO_BACKUP"):
-        print("检测到 NO_BACKUP 环境变量，不备份数据库")
+        logger.info("检测到 NO_BACKUP 环境变量，不备份数据库")
         return
-    print("通过配置 NO_BACKUP 环境环境变量避免备份数据库")
+    logger.info("通过配置 NO_BACKUP 环境环境变量避免备份数据库")
     try:
         interval_minutes = float(os.getenv("BACKUP_INTERVAL_MINUTES"))
     except (ValueError, TypeError):
-        print("未配置备份间隔环境变量 BACKUP_INTERVAL_MINUTES 或备份间隔解析失败，使用默认间隔（12小时）")
+        logger.warning("未配置备份间隔环境变量 BACKUP_INTERVAL_MINUTES 或备份间隔解析失败，使用默认间隔（12小时）")
         interval_minutes = 720
 
     def inner():
@@ -229,7 +342,7 @@ def start_backup_thread():
             except KeyboardInterrupt:
                 return
             except Exception as e:
-                print(e)
+                logger.exception("数据库备份失败，10分钟后重试: %s", e)
                 # 出现错误十分钟后重试
                 time.sleep(600)
 
@@ -273,7 +386,7 @@ class MarsInfo:
                  AND pic_dhash = ?''',
             (group_id, dhash)).fetchone()
         end = time.perf_counter_ns()
-        print("query one data time elapsed: {} us".format((end - start) / 1000))
+        logger.debug("query one data time elapsed: %s us", (end - start) / 1000)
         if row is None:
             info = MarsInfo(group_id=group_id, pic_dhash=dhash, count=0, last_msg_id=0, in_whitelist=False)
         else:
@@ -300,7 +413,7 @@ class MarsInfo:
             increase_group_stat(cursor, self.group_id)
             self.exists_in_db = True
         end = time.perf_counter_ns()
-        print("upsert one data time elapsed: {} us".format((end - start) / 1000))
+        logger.debug("upsert one data time elapsed: %s us", (end - start) / 1000)
         cursor.connection.commit()
 
     @staticmethod
@@ -485,9 +598,10 @@ async def reply_photo(update: Update, _ctx):
     chat = update.effective_chat
     user = update.effective_user
     if is_user_in_whitelist(conn.cursor(), update.effective_chat.id, update.effective_user.id):
-        print(f"user {chat.effective_name}({chat.id})/{user.full_name}({user.id}) 在白名单中，忽略")
+        logger.info("user %s(%s)/%s(%s) 在白名单中，忽略消息",
+                    chat.effective_name, chat.id, user.full_name, user.id)
         return
-    print(f"尝试处理含图片消息 {chat.effective_name}({chat.id})/{user.full_name}({user.id})")
+    logger.debug("尝试处理含图片消息 %s(%s)/%s(%s)", chat.effective_name, chat.id, user.full_name, user.id)
     if update.effective_message.media_group_id:
         if not update.edited_message:
             await reply_grouped_photo(update.effective_message)
@@ -616,7 +730,7 @@ async def send_welcome(bot, chat_id):
 
 
 async def welcome(update: Update, _ctx):
-    print(update)
+    logger.debug("收到 ChatMember 更新: %s", update)
     member = update.my_chat_member
     if update.effective_chat.type == Chat.PRIVATE:
         return
@@ -659,13 +773,10 @@ _exporting_chat: dict[int, ExportingChat] = {}
 
 
 def async_task_done(t: asyncio.Task):
-    print(f"task {t.get_name()} done")
+    logger.info("task %s done", t.get_name())
     exc = t.exception()
     if exc is not None:
-        print(f"task {t.get_name()} : exception {exc}")
-        # 打印完整的异常栈
-        tb = exc.__traceback__
-        traceback.print_exception(type(exc), exc, tb)
+        logger.error("task %s : exception %s", t.get_name(), exc, exc_info=exc)
 
 
 async def export_data(update: Update, _ctx):
@@ -679,7 +790,7 @@ async def export_data(update: Update, _ctx):
 
     async def delete_exporting():
         await asyncio.sleep(10 * 60)
-        print(f"delete exporting chat id={chat_id}")
+        logger.info("delete exporting chat id=%s", chat_id)
         _exporting_chat.pop(chat_id, None)
 
     _exporting_chat[chat_id] = ExportingChat(chat_id, time.time(), True)
@@ -697,7 +808,7 @@ async def export_data(update: Update, _ctx):
     try:
         await update.effective_message.reply_document(out_filename)
     except Exception as e:
-        print(e)
+        logger.exception("导出失败: %s", e)
         _exporting_chat.pop(chat_id, None)
         await update.effective_message.reply_text(f'导出失败，错误: {e}')
     finally:
@@ -762,11 +873,14 @@ async def find_similar_img_by_cb(update: Update, _ctx):
 
 
 def main():
+    systemd_notifier.notify_status("Initializing marsbot")
     builder = Application.builder()
-    if not os.getenv("BOT_TOKEN"):
-        print("需要配置环境变量 BOT_TOKEN, 请使用 export BOT_TOKEN=<YOUR_BOT_TOKEN> 来配置")
-        exit(1)
-    builder.token(os.getenv("BOT_TOKEN"))
+    bot_token = os.getenv("BOT_TOKEN")
+    if not bot_token:
+        logger.error("需要配置环境变量 BOT_TOKEN, 请使用 export BOT_TOKEN=<YOUR_BOT_TOKEN> 来配置")
+        systemd_notifier.notify_status("Failed: missing BOT_TOKEN")
+        return 1
+    builder.token(bot_token)
     if base_url := os.getenv('BOT_BASE_URL'):
         builder.base_url(base_url)
     if base_file_url := os.getenv('BOT_BASE_FILE_URL'):
@@ -791,6 +905,9 @@ def main():
     application.add_handler(CommandHandler("export", export_help))
 
     application.add_handler(ChatMemberHandler(welcome))
+    systemd_notifier.notify_ready()
+    systemd_notifier.notify_status("Running")
+    systemd_notifier.start_watchdog()
     application.run_polling(
         allowed_updates=[
             # 用于处理bot的按钮
@@ -800,10 +917,15 @@ def main():
             # 将来bot被加入到群组时可以回应
             Update.MY_CHAT_MEMBER
         ], drop_pending_updates=False)
+    return 0
 
 
 if __name__ == '__main__':
+    exit_code = 0
     try:
-        main()
+        exit_code = main() or 0
     finally:
+        systemd_notifier.notify_status("Stopping")
+        systemd_notifier.stop()
         conn.commit()
+    raise SystemExit(exit_code)
