@@ -43,6 +43,11 @@ def try_build_hamm_acc():
         raise FileNotFoundError(f"{outfile} not found")
 
 
+LATEST_SCHEMA_VERSION = 1
+_STAT_META_KEY_VERSION = 'schema_version'
+_STAT_META_KEY_GROUP_COUNT = 'group_count'
+
+
 def init_database(connection: sqlite3.Connection):
     cursor = connection.cursor()
     cursor.execute('''CREATE TABLE IF NOT EXISTS mars_info
@@ -65,22 +70,92 @@ def init_database(connection: sqlite3.Connection):
                           user_id  INTEGER NOT NULL,
                           PRIMARY KEY (group_id, user_id)
                       ) WITHOUT ROWID;''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS mars_group_stat
+                      (
+                          group_id     INTEGER PRIMARY KEY NOT NULL,
+                          image_count  INTEGER NOT NULL DEFAULT 0 CHECK (image_count >= 0)
+                      ) WITHOUT ROWID;''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS mars_stat_meta
+                      (
+                          key   TEXT PRIMARY KEY NOT NULL,
+                          value INTEGER NOT NULL
+                      ) WITHOUT ROWID;''')
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA synchronous=OFF")
     cursor.execute("PRAGMA cache_size=-80000;")
     try:
         try_build_hamm_acc()
-        conn.enable_load_extension(True)
+        connection.enable_load_extension(True)
         # 加载你的 hamdist.so
-        conn.load_extension("./hammdist.so")
+        connection.load_extension("./hammdist.so")
     except Exception as e:
         print(f"遇到错误，使用python内建函数，错误: {e}")
         connection.create_function('hamming_distance', 2, hamming_distance)
     connection.commit()
 
 
+def get_meta_value(cursor: sqlite3.Cursor, key: str, default=None):
+    row = cursor.execute('SELECT value FROM mars_stat_meta WHERE key=?', (key,)).fetchone()
+    if row is None:
+        return default
+    return int(row[0])
+
+
+def set_meta_value(cursor: sqlite3.Cursor, key: str, value: int):
+    cursor.execute('''INSERT INTO mars_stat_meta (key, value)
+                      VALUES (?, ?)
+                      ON CONFLICT(key) DO UPDATE SET value=excluded.value''', (key, value))
+
+
+def migrate_database(connection: sqlite3.Connection):
+    cursor = connection.cursor()
+    current_version = get_meta_value(cursor, _STAT_META_KEY_VERSION, 0)
+    if current_version >= LATEST_SCHEMA_VERSION:
+        return
+    print(f"Migrating database: version {current_version} -> {LATEST_SCHEMA_VERSION}")
+    cursor.execute('DELETE FROM mars_group_stat')
+    cursor.execute('DELETE FROM mars_stat_meta WHERE key != ?', (_STAT_META_KEY_VERSION,))
+    cursor.execute('''INSERT INTO mars_group_stat (group_id, image_count)
+                      SELECT group_id, COUNT(*)
+                      FROM mars_info
+                      GROUP BY group_id''')
+    group_count = cursor.execute('SELECT COUNT(*) FROM mars_group_stat WHERE group_id < 0').fetchone()[0]
+    set_meta_value(cursor, _STAT_META_KEY_GROUP_COUNT, group_count)
+    set_meta_value(cursor, _STAT_META_KEY_VERSION, LATEST_SCHEMA_VERSION)
+    connection.commit()
+
+
+def increase_group_stat(cursor: sqlite3.Cursor, group_id: int):
+    existed = cursor.execute('SELECT 1 FROM mars_group_stat WHERE group_id=?', (group_id,)).fetchone()
+    cursor.execute('''INSERT INTO mars_group_stat (group_id, image_count)
+                      VALUES (?, 1)
+                      ON CONFLICT(group_id) DO UPDATE SET image_count = image_count + 1''',
+                   (group_id,))
+    if existed is None and group_id < 0:
+        current_group_count = get_meta_value(cursor, _STAT_META_KEY_GROUP_COUNT, 0) or 0
+        set_meta_value(cursor, _STAT_META_KEY_GROUP_COUNT, current_group_count + 1)
+
+
+def get_group_count(cursor: sqlite3.Cursor) -> int:
+    cached = get_meta_value(cursor, _STAT_META_KEY_GROUP_COUNT)
+    if cached is not None:
+        return cached
+    group_count = cursor.execute('SELECT COUNT(*) FROM mars_group_stat WHERE group_id < 0').fetchone()[0]
+    set_meta_value(cursor, _STAT_META_KEY_GROUP_COUNT, group_count)
+    cursor.connection.commit()
+    return group_count
+
+
+def get_group_mars_count(cursor: sqlite3.Cursor, group_id: int) -> int:
+    row = cursor.execute('SELECT image_count FROM mars_group_stat WHERE group_id=?', (group_id,)).fetchone()
+    if row is None:
+        return 0
+    return row[0]
+
+
 conn = sqlite3.connect('mars.db', check_same_thread=False)
 init_database(conn)
+migrate_database(conn)
 
 
 def backup_database():
@@ -184,6 +259,7 @@ class MarsInfo:
     count: int
     last_msg_id: int
     in_whitelist: bool
+    exists_in_db: bool = False
 
     @staticmethod
     def query_or_default(cursor: sqlite3.Cursor, group_id: int, dhash: bytes) -> 'MarsInfo':
@@ -201,13 +277,14 @@ class MarsInfo:
         if row is None:
             info = MarsInfo(group_id=group_id, pic_dhash=dhash, count=0, last_msg_id=0, in_whitelist=False)
         else:
-            info = MarsInfo(*row)
+            info = MarsInfo(*row, True)
         _mars_info_weak_ref[(group_id, dhash)] = info
         return info
 
     def upsert(self, cursor: sqlite3.Cursor):
         # 存在就更新count和last_msg_id，不存在就新建一个
         start = time.perf_counter_ns()
+        is_new_record = not self.exists_in_db
 
         cursor.execute(
             '''
@@ -219,6 +296,9 @@ class MarsInfo:
             ''',
             (self.group_id, self.pic_dhash, self.count, self.last_msg_id, int(self.in_whitelist))
         )
+        if is_new_record:
+            increase_group_stat(cursor, self.group_id)
+            self.exists_in_db = True
         end = time.perf_counter_ns()
         print("upsert one data time elapsed: {} us".format((end - start) / 1000))
         cursor.connection.commit()
@@ -239,10 +319,11 @@ class MarsInfo:
                               WHERE hd < ?
                               ORDER BY hd
                               LIMIT 10''', (dhash, group_id, threshold))
-        return [MarsInfo(*row) for row in rows]
+        return [MarsInfo(*row, True) for row in rows]
 
     def clone(self) -> 'MarsInfo':
-        return MarsInfo(self.group_id, self.pic_dhash, self.count, self.last_msg_id, self.in_whitelist)
+        return MarsInfo(self.group_id, self.pic_dhash, self.count, self.last_msg_id, self.in_whitelist,
+                        self.exists_in_db)
 
 
 def get_dhash_from_fuid(cursor: sqlite3.Cursor, fuid: str) -> bytes | None:
@@ -491,9 +572,9 @@ def bot_stat_inner(update: Update):
     msg = update.effective_message
     user = update.effective_user
     start = time.perf_counter_ns()
-    group_count = conn.execute('SELECT COUNT(DISTINCT group_id) FROM mars_info WHERE group_id < 0').fetchone()[0]
-    mars_count = conn.execute('SELECT COUNT(pic_dhash) FROM mars_info WHERE group_id=?',
-                              (msg.chat_id,)).fetchone()[0]
+    cursor = conn.cursor()
+    group_count = get_group_count(cursor)
+    mars_count = get_group_mars_count(cursor, msg.chat_id)
     exists = '在' if is_user_in_whitelist(conn.cursor(), msg.chat.id, user.id) else '不在'
     end = time.perf_counter_ns()
     return (f'火星车当前一共服务了{group_count}个群组\n'
