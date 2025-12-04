@@ -44,7 +44,10 @@ def setup_logging():
     except ImportError:
         logging.basicConfig(level=level,
                             format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-
+    # --- ADD THIS PART ---
+    # Silence httpx + httpcore noise
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 setup_logging()
 logger = logging.getLogger("marsbot")
